@@ -33,9 +33,8 @@ DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 OutputDir=Output
 OutputBaseFilename=Magnivo-Setup-{#MyAppVersion}
-; Installer exe icon + uninstaller icon:
+; Installer exe icon + wizard icon + uninstaller icon:
 SetupIconFile=..\assets\logo.ico
-UninstallerIconFile=..\assets\logo.ico
 ; Icon shown in Settings > Apps > Installed apps:
 UninstallDisplayIcon={app}\{#MyAppExe}
 WizardStyle=modern
