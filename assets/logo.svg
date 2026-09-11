@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <!-- Magnivo logo: magnifying glass with a "V" lens on dark rounded tile -->
+  <rect x="8" y="8" width="240" height="240" rx="52" fill="#1e1e1e" stroke="#555555" stroke-width="4"/>
+  <!-- lens glass -->
+  <circle cx="112" cy="108" r="64" fill="#262626"/>
+  <!-- lens ring -->
+  <circle cx="112" cy="108" r="62" fill="none" stroke="#4caf50" stroke-width="20"/>
+  <!-- handle -->
+  <line x1="156" y1="152" x2="208" y2="204" stroke="#e0e0e0" stroke-width="24" stroke-linecap="round"/>
+  <!-- V for Magnivo -->
+  <text x="112" y="110" text-anchor="middle" dominant-baseline="central"
+        font-family="Arial, Helvetica, sans-serif" font-weight="bold" font-size="76" fill="#ffffff">V</text>
+</svg>

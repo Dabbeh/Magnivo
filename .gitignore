@@ -1,0 +1,40 @@
+# Qt / CMake build output (Qt Creator puts it in build/)
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.ninja
+.ninja_*
+
+# Qt Creator user-specific files (absolute paths, per-machine)
+*.user
+.qtcreator/
+.qtc/
+
+# Compiled objects / binaries
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.exe
+*.dbg
+*.pdb
+*.d
+moc_*
+ui_*
+qrc_*
+*_autogen/
+
+# Downloaded update artifacts
+*.msi
+*.zip
+Magnivo-*-update*
+
+# OS / editor junk
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
