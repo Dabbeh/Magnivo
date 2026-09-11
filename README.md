@@ -53,8 +53,11 @@ Result: `installer\Output\Magnivo-Setup-<version>.exe` (see
 The app checks its GitHub releases (`Dabbeh/Magnivo`) on start-up and in
 Settings → Update. If a newer release with a downloadable file exists,
 it asks Update/Cancel, downloads with progress, then offers
-Install && Restart. Publish a new `vX.Y.Z` tag with an `.exe` asset and
-bump `kMagnivoVersion` in `Magnivo.h` to ship an update.
+Install && Restart. To ship an update: set the new version in
+`kMagnivoVersion` (`Magnivo.h`), `Magnivo.rc`, and `MyAppVersion`
+(`installer/Magnivo.iss`), commit, then `git tag vX.Y.Z` and push the
+tag — the Release workflow builds the installer and attaches it to the
+GitHub release automatically.
 
 ## Project layout
 
