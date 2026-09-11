@@ -19,11 +19,11 @@
 #include <QDateTime>
 #include <QSignalBlocker>
 #include <QSettings>
-#include <QComboBox>
+#include <QMenu>
 #include <QTabWidget>
-#include <QLineEdit>
 #include <QDialogButtonBox>
 #include <QProgressBar>
+#include <QMessageBox>
 #include <QNetworkAccessManager>
 #include <QNetworkRequest>
 #include <QNetworkReply>
@@ -41,7 +41,9 @@
 #include <QUrl>
 #include <QIcon>
 #include <QPixmap>
+#include <QPainter>
 #include <QDebug>
+#include <cmath>
 
 #ifdef Q_OS_WIN
 #ifndef NOMINMAX
@@ -58,6 +60,7 @@ typedef BOOL (WINAPI *PFN_MagInitialize)(void);
 typedef BOOL (WINAPI *PFN_MagUninitialize)(void);
 typedef BOOL (WINAPI *PFN_MagSetFullscreenTransform)(float, int, int);
 typedef BOOL (WINAPI *PFN_MagSetWindowFilterList)(HWND, DWORD, int, HWND*);
+typedef BOOL (WINAPI *PFN_MagSetInputTransform)(BOOL, const RECT*, const RECT*);
 struct MagColorEffect { float transform[5][5]; };
 typedef BOOL (WINAPI *PFN_MagSetFullscreenColorEffect)(MagColorEffect*);
 
@@ -67,6 +70,7 @@ static PFN_MagUninitialize pMagUninitialize = nullptr;
 static PFN_MagSetFullscreenTransform pMagSetFullscreenTransform = nullptr;
 static PFN_MagSetWindowFilterList pMagSetWindowFilterList = nullptr;
 static PFN_MagSetFullscreenColorEffect pMagSetFullscreenColorEffect = nullptr;
+static PFN_MagSetInputTransform pMagSetInputTransform = nullptr;
 
 static bool magLoad() {
     if (g_magDll) return pMagInitialize != nullptr;
@@ -77,6 +81,7 @@ static bool magLoad() {
     pMagSetFullscreenTransform = (PFN_MagSetFullscreenTransform)GetProcAddress(g_magDll, "MagSetFullscreenTransform");
     pMagSetWindowFilterList = (PFN_MagSetWindowFilterList)GetProcAddress(g_magDll, "MagSetWindowFilterList");
     pMagSetFullscreenColorEffect = (PFN_MagSetFullscreenColorEffect)GetProcAddress(g_magDll, "MagSetFullscreenColorEffect");
+    pMagSetInputTransform = (PFN_MagSetInputTransform)GetProcAddress(g_magDll, "MagSetInputTransform");
     if (!pMagInitialize || !pMagUninitialize || !pMagSetFullscreenTransform)
         qWarning() << "Magnivo: GetProcAddress failed for Mag API";
     return pMagInitialize && pMagUninitialize && pMagSetFullscreenTransform;
@@ -131,15 +136,22 @@ QString ZoomMod::name(int vk) {
     return "Ctrl";
 }
 QString ZoomMod::githubRepo() {
-    QSettings s;
-    QString repo = s.value("githubRepo", "").toString().trimmed();
-    if (repo.isEmpty())
-        repo = oldMagnifyValue("githubRepo").toString().trimmed();
-    return repo;
+    // Hardcoded: users never type this anymore. Old per-user overrides are
+    // ignored so "Check for updates" always hits our own releases.
+    return QString::fromLatin1(kMagnivoUpdateRepo);
 }
-void ZoomMod::setGithubRepo(const QString &repo) {
+void ZoomMod::setGithubRepo(const QString &) {
+    // No-op kept for compat (old settings files may still contain a value).
+}
+
+int Theme::load() {
     QSettings s;
-    s.setValue("githubRepo", repo.trimmed());
+    int t = s.value("appearance", Theme::Dark).toInt();
+    return (t == Theme::Light) ? Theme::Light : Theme::Dark;
+}
+void Theme::save(int theme) {
+    QSettings s;
+    s.setValue("appearance", (theme == Theme::Light) ? Theme::Light : Theme::Dark);
 }
 
 #ifdef Q_OS_WIN
@@ -147,6 +159,10 @@ static Magnivo *g_inst = nullptr;
 static HHOOK g_mouseHook = nullptr;
 static HHOOK g_kbHook = nullptr;
 static qint64 g_lastToggleMs = 0;
+// Tags already shown/dismissed this session so the background monitor doesn't
+// nag twice for the same release. Manual "Check for updates" always reports.
+static QString g_notifiedTag;
+static QString g_dismissedTag;
 
 static void requestToggle() {
     qint64 now = QDateTime::currentMSecsSinceEpoch();
@@ -159,18 +175,33 @@ static void requestToggle() {
 }
 
 static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode == HC_ACTION && wParam == WM_MOUSEWHEEL && g_inst) {
+    // Handle vertical + horizontal wheel. Touchpads often emit high-res
+    // partial deltas and/or injected Ctrl+wheel for pinch: treat every tick
+    // proportionally so zoom-in then zoom-out always returns to start
+    // (fixed +/-0.25 steps overshoot to max and feel "stuck").
+    bool isWheel = (nCode == HC_ACTION &&
+                    (wParam == WM_MOUSEWHEEL || wParam == WM_MOUSEHWHEEL) &&
+                    g_inst);
+    if (isWheel) {
         MSLLHOOKSTRUCT *ms = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
-        // <Modifier>+wheel anywhere = intentional zoom, always allowed.
-        // This is the global gesture that works while other apps have focus.
-        if (isZoomModHeld()) {
-            short delta = GET_WHEEL_DELTA_WPARAM(ms->mouseData);
-            Magnivo *inst = g_inst;
-            QTimer::singleShot(0, inst, [inst, delta]() {
-                if (delta > 0) inst->zoomIn();
-                else inst->zoomOut();
-            });
-            return 1; // swallow so the app behind doesn't also zoom
+        bool modHeld = isZoomModHeld();
+        // When ACTIVE, plain wheel also zooms (that's what ACTIVE means:
+        // gestures hijack the wheel until you press F8 again). When OFF,
+        // only <Modifier>+wheel zooms so normal scrolling is untouched.
+        // Either way we swallow the event so the app behind never does its
+        // own per-app zoom (browser 150% etc.) while Magnivo zooms system-wide.
+        // That split-brain (app zoomed, Magnivo at 100%) was the old
+        // "zoomed in some app but can't zoom out" bug.
+        bool armed = g_inst->armed();
+        if (modHeld || armed) {
+            int delta = (short)HIWORD(ms->mouseData);
+            if (delta != 0) {
+                Magnivo *inst = g_inst;
+                QTimer::singleShot(0, inst, [inst, delta]() {
+                    inst->zoomByWheelDelta(delta);
+                });
+            }
+            return 1; // swallow even for tiny deltas: keeps app + Magnivo in sync
         }
     }
     return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
@@ -198,42 +229,123 @@ static LRESULT CALLBACK KbProc(int nCode, WPARAM wParam, LPARAM lParam) {
 }
 #endif
 
+// ---------------- OptionDropDown ----------------
+
+OptionDropDown::OptionDropDown(QWidget *parent) : QPushButton(parent) {
+    setCursor(Qt::PointingHandCursor);
+    connect(this, &QPushButton::clicked, this, &OptionDropDown::showMenu);
+}
+
+void OptionDropDown::addItem(const QString &text, int data) {
+    m_items.append({text, data});
+    if (m_cur < 0) { m_cur = 0; refreshText(); }
+}
+
+int OptionDropDown::findData(int data) const {
+    for (int i = 0; i < m_items.size(); ++i)
+        if (m_items[i].data == data) return i;
+    return -1;
+}
+
+int OptionDropDown::currentData() const {
+    return (m_cur >= 0 && m_cur < m_items.size()) ? m_items[m_cur].data : -1;
+}
+
+int OptionDropDown::currentIndex() const { return m_cur; }
+
+void OptionDropDown::setCurrentIndex(int i) {
+    if (i < 0 || i >= m_items.size() || i == m_cur) return;
+    m_cur = i;
+    refreshText();
+    emit currentIndexChanged(m_cur);
+}
+
+void OptionDropDown::setMenuStyleSheet(const QString &st) {
+    m_menuStyle = st;
+}
+
+void OptionDropDown::refreshText() {
+    // Glyph arrow drawn as text: visible in every theme, no image assets.
+    QString t = (m_cur >= 0 && m_cur < m_items.size()) ? m_items[m_cur].text : QString();
+    setText(t + QString::fromUtf8("   \u25be")); // ▾
+}
+
+void OptionDropDown::showMenu() {
+    QMenu menu(this);
+    if (!m_menuStyle.isEmpty()) menu.setStyleSheet(m_menuStyle);
+    menu.setMinimumWidth(width());
+    for (int i = 0; i < m_items.size(); ++i) {
+        QAction *a = menu.addAction(m_items[i].text);
+        a->setCheckable(true);
+        a->setChecked(i == m_cur);
+        a->setData(i);
+    }
+    QAction *picked = menu.exec(mapToGlobal(QPoint(0, height() + 2)));
+    if (picked) setCurrentIndex(picked->data().toInt());
+}
+
 // ---------------- ControlPanel ----------------
 
-ControlPanel::ControlPanel(QWidget *parent) : QWidget(parent) {
+ControlPanel::ControlPanel(QWidget *parent) : QWidget(parent), m_theme(Theme::load()) {
     setWindowFlags(Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint | Qt::Tool);
     setWindowIcon(QIcon(":/logo.png"));
     setAttribute(Qt::WA_StyledBackground, true);
+    // Translucent window + painted rounded rect (see paintEvent): the only way
+    // to get smooth anti-aliased round corners on a frameless window. The
+    // 1-bit setMask() clip made them look chopped; stylesheet backgrounds
+    // alone paint square corners.
+    setAttribute(Qt::WA_TranslucentBackground, true);
     setAttribute(Qt::WA_AcceptTouchEvents, true);
     grabGesture(Qt::PinchGesture);
-    setStyleSheet("ControlPanel{background:#1e1e1e;border:1px solid #555;border-radius:10px;}"
-                  "QLabel{color:white;font-size:16px;font-weight:bold;}"
-                  "QPushButton{background:#333;color:white;border:1px solid #666;border-radius:8px;font-size:16px;}"
-                  "QPushButton:hover{background:#444;}"
-                  "QPushButton:disabled{background:#222;color:#777;border:1px solid #444;}");
 
     auto *main = new QVBoxLayout(this);
-    main->setContentsMargins(8, 8, 8, 8);
+    // Top margin 0 + right margin 0: the title bar sits flush against the
+    // top window edge and the X sits right on the border, like a real bar.
+    main->setContentsMargins(10, 0, 0, 10);
     main->setSpacing(8);
 
-    auto *topRow = new QHBoxLayout();
-    topRow->setSpacing(8);
+    // --- Title bar: app icon + name on the left, gear + X on the right ---
+    auto *titleBar = new QHBoxLayout();
+    titleBar->setSpacing(6);
+    auto *iconLabel = new QLabel(this);
+    QPixmap iconPx(":/logo.png");
+    if (!iconPx.isNull())
+        iconLabel->setPixmap(iconPx.scaled(20, 20, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+    iconLabel->setFixedSize(20, 32);
+    iconLabel->setAlignment(Qt::AlignCenter);
+    iconLabel->setAttribute(Qt::WA_TransparentForMouseEvents, true); // drag-through
+    m_titleName = new QLabel("Magnivo", this);
+    m_titleName->setObjectName("titleName");
+    m_titleName->setAttribute(Qt::WA_TransparentForMouseEvents, true); // drag-through
+    m_settingsBtn = new QPushButton(QString::fromUtf8("\u2699"), this); // gear icon
+    m_settingsBtn->setObjectName("titleBtn");
+    m_settingsBtn->setFixedSize(36, 28);
+    m_settingsBtn->setCursor(Qt::PointingHandCursor);
+    m_settingsBtn->setToolTip("Settings, updates and about");
+    m_closeBtn = new QPushButton(QString::fromUtf8("\u2715"), this); // X on the border
+    m_closeBtn->setObjectName("closeBtn");
+    m_closeBtn->setFixedSize(44, 32);
+    m_closeBtn->setCursor(Qt::PointingHandCursor);
+    m_closeBtn->setToolTip("Close - screen goes back to normal");
+    titleBar->addWidget(iconLabel);
+    titleBar->addWidget(m_titleName);
+    titleBar->addStretch(1);
+    titleBar->addWidget(m_settingsBtn, 0, Qt::AlignVCenter);
+    titleBar->addWidget(m_closeBtn, 0, Qt::AlignTop);
+
+    auto *armRow = new QHBoxLayout();
+    armRow->setContentsMargins(0, 0, 10, 0);
+    armRow->setSpacing(8);
     m_armBtn = new QPushButton("ACTIVATE (F8)", this);
     m_armBtn->setCheckable(true);
     m_armBtn->setChecked(false);
     m_armBtn->setMinimumHeight(48);
     m_armBtn->setCursor(Qt::PointingHandCursor);
-    m_armBtn->setToolTip("Arm gestures. When OFF, swipes are ignored so you never zoom by accident.\nToggle with F8 or Ctrl+Alt+M anywhere, or hold Ctrl while pinching.");
-    auto *closeBtn = new QPushButton("X", this);
-    closeBtn->setMinimumSize(48, 48);
-    closeBtn->setCursor(Qt::PointingHandCursor);
-    closeBtn->setToolTip("Close - screen goes back to normal");
-    closeBtn->setStyleSheet("QPushButton{background:#a33;color:white;border-radius:8px;}"
-                            "QPushButton:hover{background:#c44;}");
-    topRow->addWidget(m_armBtn, 1);
-    topRow->addWidget(closeBtn);
+    m_armBtn->setToolTip("Arm gestures.\nOFF: hold the zoom key + wheel to zoom (auto-arms).\nACTIVE: wheel / pinch zooms anywhere, F8 stops.");
+    armRow->addWidget(m_armBtn, 1);
 
     auto *botRow = new QHBoxLayout();
+    botRow->setContentsMargins(0, 0, 10, 0);
     botRow->setSpacing(8);
     auto *minusBtn = new QPushButton("-", this);
     m_label = new QLabel("OFF", this);
@@ -251,38 +363,87 @@ ControlPanel::ControlPanel(QWidget *parent) : QWidget(parent) {
     botRow->addWidget(m_label, 1);
     botRow->addWidget(plusBtn);
 
-    auto *menuRow = new QHBoxLayout();
-    menuRow->setSpacing(8);
-    auto *versionLabel = new QLabel(QString("v%1").arg(QString::fromLatin1(kMagnivoVersion)), this);
-    versionLabel->setStyleSheet("QLabel{color:#888;font-size:11px;font-weight:normal;}");
-    versionLabel->setAttribute(Qt::WA_TransparentForMouseEvents, true);
-    auto *settingsBtn = new QPushButton(QString::fromUtf8("\u2699"), this); // gear icon
-    settingsBtn->setMinimumSize(48, 32);
-    settingsBtn->setMaximumWidth(48);
-    settingsBtn->setCursor(Qt::PointingHandCursor);
-    settingsBtn->setToolTip("Settings, updates and about");
-    settingsBtn->setStyleSheet("QPushButton{font-size:20px;padding-bottom:2px;}");
-    menuRow->addWidget(versionLabel);
-    menuRow->addStretch(1);
-    menuRow->addWidget(settingsBtn);
-
-    main->addLayout(topRow);
+    main->addLayout(titleBar);
+    main->addLayout(armRow);
     main->addLayout(botRow);
-    main->addLayout(menuRow);
 
     connect(minusBtn, &QPushButton::clicked, this, &ControlPanel::zoomOutClicked);
     connect(plusBtn, &QPushButton::clicked, this, &ControlPanel::zoomInClicked);
-    connect(closeBtn, &QPushButton::clicked, this, &ControlPanel::closeClicked);
+    connect(m_closeBtn, &QPushButton::clicked, this, &ControlPanel::closeClicked);
     connect(m_armBtn, &QPushButton::toggled, this, &ControlPanel::armToggled);
-    connect(settingsBtn, &QPushButton::clicked, this, &ControlPanel::settingsClicked);
+    connect(m_settingsBtn, &QPushButton::clicked, this, &ControlPanel::settingsClicked);
 
     auto *esc = new QAction(this);
     esc->setShortcut(Qt::Key_Escape);
     connect(esc, &QAction::triggered, this, &ControlPanel::closeClicked);
     addAction(esc);
 
-    setFixedSize(300, 160);
+    setFixedSize(300, 156);
+    applyTheme(m_theme);
     setArmed(false);
+}
+
+void ControlPanel::applyTheme(int theme) {
+    m_theme = (theme == Theme::Light) ? Theme::Light : Theme::Dark;
+    // NOTE: the panel fill/border are painted in paintEvent (smooth round
+    // corners), not via stylesheet, so there is no ControlPanel{...} rule.
+    if (m_theme == Theme::Light) {
+        m_bgColor = QColor("#f4f4f5");
+        m_borderColor = QColor("#d4d4d8");
+        setStyleSheet("QLabel{color:#18181b;font-size:16px;font-weight:bold;}"
+                      "QLabel#titleName{color:#18181b;font-size:13px;font-weight:bold;}"
+                      "QPushButton{background:#e4e4e7;color:#18181b;border:1px solid #d4d4d8;border-radius:8px;font-size:16px;}"
+                      "QPushButton:hover{background:#d4d4d8;border-color:#a1a1aa;}"
+                      "QPushButton:disabled{background:#f4f4f5;color:#a1a1aa;border:1px solid #e4e4e7;}"
+                      "QPushButton#titleBtn{background:transparent;border:none;border-radius:6px;font-size:18px;color:#52525b;}"
+                      "QPushButton#titleBtn:hover{background:#d4d4d8;color:#18181b;}"
+                      "QPushButton#closeBtn{background:transparent;border:none;border-top-right-radius:11px;font-size:13px;font-weight:bold;color:#52525b;}"
+                      "QPushButton#closeBtn:hover{background:#e81123;color:white;}");
+    } else {
+        m_bgColor = QColor("#1e1e1e");
+        m_borderColor = QColor("#555555");
+        setStyleSheet("QLabel{color:white;font-size:16px;font-weight:bold;}"
+                      "QLabel#titleName{color:white;font-size:13px;font-weight:bold;}"
+                      "QPushButton{background:#333;color:white;border:1px solid #666;border-radius:8px;font-size:16px;}"
+                      "QPushButton:hover{background:#444;}"
+                      "QPushButton:disabled{background:#222;color:#777;border:1px solid #444;}"
+                      "QPushButton#titleBtn{background:transparent;border:none;border-radius:6px;font-size:18px;color:#b0b0b0;}"
+                      "QPushButton#titleBtn:hover{background:#444;color:white;}"
+                      "QPushButton#closeBtn{background:transparent;border:none;border-top-right-radius:11px;font-size:13px;font-weight:bold;color:#b0b0b0;}"
+                      "QPushButton#closeBtn:hover{background:#e81123;color:white;}");
+    }
+    refreshArmButton();
+    update(); // repaint the rounded background
+}
+
+void ControlPanel::paintEvent(QPaintEvent *) {
+    QPainter p(this);
+    p.setRenderHint(QPainter::Antialiasing, true);
+    QRectF r = QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5);
+    p.setBrush(m_bgColor);
+    p.setPen(QPen(m_borderColor, 1));
+    p.drawRoundedRect(r, 12, 12);
+}
+
+void ControlPanel::refreshArmButton() {
+    bool armed = m_armBtn && m_armBtn->isChecked();
+    if (armed) {
+        m_armBtn->setText("ACTIVE - pinch to zoom");
+        if (m_theme == Theme::Light)
+            m_armBtn->setStyleSheet("QPushButton{background:#16a34a;color:white;border:1px solid #15803d;border-radius:8px;font-size:13px;font-weight:bold;}"
+                                   "QPushButton:hover{background:#15803d;}");
+        else
+            m_armBtn->setStyleSheet("QPushButton{background:#1d5c2e;color:white;border:1px solid #4caf50;border-radius:8px;font-size:13px;font-weight:bold;}"
+                                   "QPushButton:hover{background:#257a3c;}");
+    } else {
+        m_armBtn->setText("ACTIVATE (F8)");
+        if (m_theme == Theme::Light)
+            m_armBtn->setStyleSheet("QPushButton{background:#e4e4e7;color:#18181b;border:1px solid #d4d4d8;border-radius:8px;font-size:13px;}"
+                                   "QPushButton:hover{background:#d4d4d8;border-color:#a1a1aa;}");
+        else
+            m_armBtn->setStyleSheet("QPushButton{background:#333;color:white;border:1px solid #666;border-radius:8px;font-size:13px;}"
+                                   "QPushButton:hover{background:#444;}");
+    }
 }
 
 void ControlPanel::setZoom(float zoom) {
@@ -295,28 +456,23 @@ void ControlPanel::setArmed(bool armed) {
     // block to avoid armToggled -> Magnivo::setArmed recursion loop
     const QSignalBlocker blocker(m_armBtn);
     m_armBtn->setChecked(armed);
-    if (armed) {
-        m_armBtn->setText("ACTIVE - pinch to zoom");
-        m_armBtn->setStyleSheet("QPushButton{background:#1d5c2e;color:white;border:1px solid #4caf50;border-radius:8px;font-size:16px;font-weight:bold;}"
-                               "QPushButton:hover{background:#257a3c;}");
-    } else {
-        m_armBtn->setText("ACTIVATE (F8)");
-        // Same look as the +/- buttons (see ControlPanel stylesheet)
-        m_armBtn->setStyleSheet("QPushButton{background:#333;color:white;border:1px solid #666;border-radius:8px;font-size:16px;}"
-                               "QPushButton:hover{background:#444;}");
+    if (!armed)
         m_label->setText("OFF");
-    }
+    refreshArmButton(); // text + colors for current theme
 }
 
 void ControlPanel::setModifierName(const QString &modName) {
     m_modName = modName;
-    m_armBtn->setToolTip(QString("Arm gestures. When OFF, swipes are ignored so you never zoom by accident.\n"
-                                "Toggle with F8 or Ctrl+Alt+M anywhere, or hold %1 while pinching/wheeling.").arg(m_modName));
+    m_armBtn->setToolTip(QString("Arm gestures.\nOFF: hold %1 + wheel anywhere to zoom (auto-arms).\n"
+                                "ACTIVE: wheel / pinch zooms anywhere. F8 or Ctrl+Alt+M toggles.").arg(m_modName));
 }
 
 bool ControlPanel::event(QEvent *e) {
-    // Pinch over the panel. Pinch anywhere else is handled globally
-    // via <Modifier>+wheel hook (see Magnivo hooks) to avoid blocking other apps.
+    // Pinch directly over the panel (touchscreen / precision touchpad).
+    // Pinch anywhere else never reaches us: Windows delivers bare gestures to
+    // the window under the fingers (e.g. Desktop), so out there zooming goes
+    // through the global wheel hook instead - <Modifier>+wheel when OFF,
+    // plain wheel too when ACTIVE (see Magnivo hooks).
     if (e->type() == QEvent::NativeGesture) {
         auto *nge = static_cast<QNativeGestureEvent*>(e);
         if (nge->gestureType() == Qt::ZoomNativeGesture) {
@@ -372,19 +528,117 @@ void ControlPanel::mouseMoveEvent(QMouseEvent *e) {
 
 // ---------------- SettingsDialog (General | Update | About) ----------------
 
+QString SettingsDialog::menuStyle(int theme) {
+    if (theme == Theme::Light)
+        return QString("QMenu{background:white;color:#18181b;border:1px solid #d4d4d8;padding:4px;}"
+                       "QMenu::item{padding:7px 26px 7px 12px;background:transparent;}"
+                       "QMenu::item:selected{background:#2563eb;color:white;}"
+                       "QMenu::indicator{width:14px;height:14px;}");
+    return QString("QMenu{background:#2d2d2d;color:white;border:1px solid #555;padding:4px;}"
+                   "QMenu::item{padding:7px 26px 7px 12px;background:transparent;}"
+                   "QMenu::item:selected{background:#3b82f6;color:white;}"
+                   "QMenu::indicator{width:14px;height:14px;}");
+}
+
+QString SettingsDialog::settingsStyle(int theme) {
+    if (theme == Theme::Light) {
+        return QString(
+            "SettingsDialog{background:#f4f4f5;}"
+            "QTabWidget::pane{border:1px solid #d4d4d8;border-radius:8px;background:white;}"
+            "QTabBar::tab{background:#e4e4e7;color:#3f3f46;padding:8px 18px;margin-right:4px;border-top-left-radius:8px;border-top-right-radius:8px;font-size:13px;}"
+            "QTabBar::tab:selected{background:white;color:#09090b;font-weight:bold;}"
+            "QLabel{color:#18181b;font-size:13px;}"
+            "QLabel#title{font-size:15px;font-weight:bold;}"
+            "QLabel#hint{color:#71717a;font-size:12px;}"
+            "QLabel#subtle{color:#52525b;font-size:12px;}"
+            "QProgressBar{background:#e4e4e7;border:1px solid #d4d4d8;border-radius:6px;text-align:center;color:#18181b;font-size:12px;}"
+            "QProgressBar::chunk{background:#2563eb;border-radius:4px;}"
+            "QPushButton{background:#e4e4e7;color:#18181b;border:1px solid #d4d4d8;border-radius:6px;padding:8px 16px;font-size:13px;}"
+            "QPushButton:hover{background:#d4d4d8;border-color:#a1a1aa;}"
+            "QPushButton:disabled{background:#f4f4f5;color:#a1a1aa;border:1px solid #e4e4e7;}"
+            "QPushButton#primary{background:#2563eb;color:white;border:1px solid #2563eb;font-weight:bold;}"
+            "QPushButton#primary:hover{background:#1d4ed8;border-color:#1d4ed8;}"
+            "QPushButton#primary:disabled{background:#bfdbfe;border-color:#bfdbfe;color:#eff6ff;}"
+            "QDialogButtonBox QPushButton{background:#e4e4e7;color:#18181b;border:1px solid #d4d4d8;border-radius:6px;padding:8px 22px;font-size:13px;min-width:80px;}"
+            "QDialogButtonBox QPushButton:hover{background:#d4d4d8;border-color:#71717a;}"
+            "QDialogButtonBox QPushButton[text=\"OK\"]{background:#2563eb;color:white;border:1px solid #2563eb;font-weight:bold;}"
+            "QDialogButtonBox QPushButton[text=\"OK\"]:hover{background:#1d4ed8;border-color:#1e40af;}");
+    }
+    // Dark (default, matches the control panel).
+    return QString(
+        "SettingsDialog{background:#1e1e1e;}"
+        "QTabWidget::pane{border:1px solid #444;border-radius:8px;background:#252526;}"
+        "QTabBar::tab{background:#2d2d2d;color:#b0b0b0;padding:8px 18px;margin-right:4px;border-top-left-radius:8px;border-top-right-radius:8px;font-size:13px;}"
+        "QTabBar::tab:selected{background:#252526;color:white;font-weight:bold;}"
+        "QLabel{color:#e8e8e8;font-size:13px;}"
+        "QLabel#title{font-size:15px;font-weight:bold;color:white;}"
+        "QLabel#hint{color:#a1a1aa;font-size:12px;}"
+        "QLabel#subtle{color:#b0b0b0;font-size:12px;}"
+        "QProgressBar{background:#333;border:1px solid #555;border-radius:6px;text-align:center;color:#e8e8e8;font-size:12px;}"
+        "QProgressBar::chunk{background:#3b82f6;border-radius:4px;}"
+        "QPushButton{background:#333;color:white;border:1px solid #555;border-radius:6px;padding:8px 16px;font-size:13px;}"
+        "QPushButton:hover{background:#444;border-color:#888;}"
+        "QPushButton:disabled{background:#252526;color:#777;border:1px solid #444;}"
+        "QPushButton#primary{background:#2563eb;color:white;border:1px solid #2563eb;font-weight:bold;}"
+        "QPushButton#primary:hover{background:#3b82f6;border-color:#3b82f6;}"
+        "QPushButton#primary:disabled{background:#333;border-color:#444;color:#777;}"
+        "QDialogButtonBox QPushButton{background:#333;color:white;border:1px solid #555;border-radius:6px;padding:8px 22px;font-size:13px;min-width:80px;}"
+        "QDialogButtonBox QPushButton:hover{background:#444;border-color:#888;}"
+        "QDialogButtonBox QPushButton[text=\"OK\"]{background:#2563eb;color:white;border:1px solid #2563eb;font-weight:bold;}"
+        "QDialogButtonBox QPushButton[text=\"OK\"]:hover{background:#3b82f6;border-color:#60a5fa;}");
+}
+
+QString SettingsDialog::messageBoxStyle(int theme) {
+    if (theme == Theme::Light)
+        return QString("QMessageBox{background:#ffffff;} QLabel{color:#18181b;font-size:13px;}"
+                       "QPushButton{background:#e4e4e7;color:#18181b;border:1px solid #d4d4d8;border-radius:6px;padding:8px 22px;min-width:80px;}"
+                       "QPushButton:hover{background:#d4d4d8;border-color:#71717a;}");
+    return QString("QMessageBox{background:#252526;} QLabel{color:#e8e8e8;font-size:13px;}"
+                   "QPushButton{background:#333;color:white;border:1px solid #555;border-radius:6px;padding:8px 22px;min-width:80px;}"
+                   "QPushButton:hover{background:#444;border-color:#888;}");
+}
+
+void SettingsDialog::applyTheme(int theme) {
+    if (theme != Theme::Light) theme = Theme::Dark;
+    setStyleSheet(settingsStyle(theme));
+    const QString ms = menuStyle(theme);
+    if (m_modBox) m_modBox->setMenuStyleSheet(ms);
+    if (m_themeBox) m_themeBox->setMenuStyleSheet(ms);
+}
+
+void SettingsDialog::onThemeChanged(int) {
+    int theme = m_themeBox ? m_themeBox->currentData() : Theme::Dark;
+    applyTheme(theme);
+}
+
 SettingsDialog::SettingsDialog(QWidget *parent, int initialTab) : QDialog(parent) {
     setWindowTitle("Magnivo Settings");
     setWindowIcon(QIcon(":/logo.png"));
     setModal(true);
+
+    // ---- Theme (dark default) + OK/Cancel hover feedback ----
+    applyTheme(Theme::load());
+
     auto *mainLay = new QVBoxLayout(this);
+    mainLay->setContentsMargins(16, 16, 16, 16);
+    mainLay->setSpacing(12);
     m_tabs = new QTabWidget(this);
     mainLay->addWidget(m_tabs);
 
-    // --- General tab: modifier + repo ---
+    // --- General tab: zoom key + appearance ---
     auto *general = new QWidget(this);
-    auto *form = new QFormLayout(general);
-
-    m_modBox = new QComboBox(general);
+    auto *glay = new QVBoxLayout(general);
+    glay->setContentsMargins(20, 20, 20, 20);
+    glay->setSpacing(12);
+    auto *title = new QLabel("Zoom key", general);
+    title->setObjectName("title");
+    auto *desc = new QLabel("Hold this key and use the mouse wheel or touchpad scroll anywhere to zoom.", general);
+    desc->setWordWrap(true);
+    auto *modRow = new QHBoxLayout();
+    auto *modLabel = new QLabel("Zoom key + wheel:", general);
+    modLabel->setMinimumWidth(130);
+    m_modBox = new OptionDropDown(general);
+    m_modBox->setMinimumWidth(170);
     m_modBox->addItem("Ctrl", ZoomMod::Ctrl);
     m_modBox->addItem("Alt", ZoomMod::Alt);
     m_modBox->addItem("Shift", ZoomMod::Shift);
@@ -393,39 +647,66 @@ SettingsDialog::SettingsDialog(QWidget *parent, int initialTab) : QDialog(parent
     int idx = m_modBox->findData(cur);
     if (idx >= 0) m_modBox->setCurrentIndex(idx);
     m_modBox->setToolTip("Hold this key + mouse wheel anywhere to zoom");
-
-    m_repoEdit = new QLineEdit(ZoomMod::githubRepo(), general);
-    m_repoEdit->setPlaceholderText("owner/repo  e.g. octocat/Hello-World");
-    m_repoEdit->setToolTip("GitHub repo used by Update checker (releases)");
-
-    form->addRow("Zoom modifier + wheel:", m_modBox);
-    form->addRow("GitHub repo:", m_repoEdit);
-
-    auto *hint = new QLabel("Hold the modifier + wheel anywhere to zoom.\nPinch gestures also require it unless ACTIVE.", general);
+    modRow->addWidget(modLabel);
+    modRow->addWidget(m_modBox);
+    modRow->addStretch(1);
+    auto *themeRow = new QHBoxLayout();
+    auto *themeLabel = new QLabel("Appearance:", general);
+    themeLabel->setMinimumWidth(130);
+    m_themeBox = new OptionDropDown(general);
+    m_themeBox->setMinimumWidth(170);
+    m_themeBox->addItem("Dark", Theme::Dark);
+    m_themeBox->addItem("Light", Theme::Light);
+    int curTheme = Theme::load();
+    int tidx = m_themeBox->findData(curTheme);
+    if (tidx >= 0) m_themeBox->setCurrentIndex(tidx);
+    m_themeBox->setToolTip("Dark or light settings window");
+    themeRow->addWidget(themeLabel);
+    themeRow->addWidget(m_themeBox);
+    themeRow->addStretch(1);
+    auto *hint = new QLabel("On the desktop: hold the zoom key + two-finger scroll, "
+                            "or press ACTIVATE (F8) first and then scroll / pinch with no key.\n"
+                            "Bare pinch only works when ACTIVE (or right over the Magnivo panel): "
+                            "when OFF it is ignored so you never zoom by accident.\n"
+                            "Press F8 again to get normal scrolling back.", general);
+    hint->setObjectName("hint");
     hint->setWordWrap(true);
-    form->addRow(hint);
+    glay->addWidget(title);
+    glay->addWidget(desc);
+    glay->addLayout(modRow);
+    glay->addLayout(themeRow);
+    glay->addWidget(hint);
+    glay->addStretch(1);
     m_tabs->addTab(general, "General");
 
-    // --- Update tab: in-app updater ---
+    // --- Update tab: one button, clear status ---
     auto *update = new QWidget(this);
     auto *ulay = new QVBoxLayout(update);
-    m_status = new QLabel("Press Check to look for updates.", update);
+    ulay->setContentsMargins(20, 20, 20, 20);
+    ulay->setSpacing(10);
+    m_status = new QLabel("Press \"Check for updates\" to see if a new version is available.", update);
     m_status->setWordWrap(true);
+    m_status->setStyleSheet("QLabel{font-size:14px;font-weight:bold;}");
     m_detail = new QLabel(QString("Current version: v%1").arg(QString::fromLatin1(kMagnivoVersion)), update);
     m_detail->setWordWrap(true);
+    m_detail->setObjectName("subtle");
     m_bar = new QProgressBar(update);
     m_bar->setRange(0, 100);
     m_bar->setValue(0);
+    m_bar->setTextVisible(true);
     m_stats = new QLabel("", update);
+    m_stats->setObjectName("subtle");
 
     auto *btnRow = new QHBoxLayout();
-    m_checkBtn = new QPushButton("Check", update);
-    m_downloadBtn = new QPushButton("Download", update);
+    m_checkBtn = new QPushButton("Check for updates", update);
+    m_checkBtn->setObjectName("primary");
+    m_checkBtn->setCursor(Qt::PointingHandCursor);
+    m_checkBtn->setMinimumHeight(36);
     m_installBtn = new QPushButton("Install && Restart", update);
-    m_downloadBtn->setEnabled(false);
+    m_installBtn->setCursor(Qt::PointingHandCursor);
+    m_installBtn->setMinimumHeight(36);
     m_installBtn->setEnabled(false);
     btnRow->addWidget(m_checkBtn);
-    btnRow->addWidget(m_downloadBtn);
     btnRow->addWidget(m_installBtn);
     btnRow->addStretch(1);
 
@@ -440,10 +721,12 @@ SettingsDialog::SettingsDialog(QWidget *parent, int initialTab) : QDialog(parent
     // --- About tab ---
     auto *about = new QWidget(this);
     auto *alay = new QVBoxLayout(about);
+    alay->setContentsMargins(20, 20, 20, 20);
+    alay->setSpacing(8);
     auto *logoLabel = new QLabel(about);
     QPixmap logoPx(":/logo.png");
     if (!logoPx.isNull())
-        logoLabel->setPixmap(logoPx.scaled(72, 72, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+        logoLabel->setPixmap(logoPx.scaled(64, 64, Qt::KeepAspectRatio, Qt::SmoothTransformation));
     logoLabel->setAlignment(Qt::AlignHCenter);
     alay->addWidget(logoLabel);
     auto *label = new QLabel(about);
@@ -451,23 +734,14 @@ SettingsDialog::SettingsDialog(QWidget *parent, int initialTab) : QDialog(parent
     label->setTextFormat(Qt::RichText);
     label->setText(
         QString("<h2>Magnivo v%1</h2>"
-                "<p>A fullscreen screen magnifier like the built-in Windows screen magnifier, "
-                "but with easy <b>touchpad / touchscreen gestures</b> for laptops.</p>"
-                "<p><b>How it works:</b></p>"
-                "<ul>"
-                "<li>Uses the Windows <b>Magnification API</b> fullscreen transform "
-                "(GPU, no flicker, no screen capture).</li>"
-                "<li><b>Follow-cursor:</b> the zoomed view is recentered on your "
-                "cursor ~60 times/sec, clamped so you never see black edges.</li>"
-                "<li><b>Controls:</b> ACTIVATE button or <b>F8</b> / <b>Ctrl+Alt+M</b> "
-                "to arm, <b>+/-</b> buttons to zoom, "
-                "<b>%2+wheel anywhere</b> to zoom at the cursor, "
-                "pinch over the panel on touchscreens.</li>"
-                "<li>The control panel excludes itself from magnification so it "
-                "stays small and clickable while everything else is zoomed.</li>"
-                "</ul>"
-                "<p>Tip: remap the wheel key in <b>General</b>, check the <b>Update</b> "
-                "tab for new GitHub releases.</p>")
+                "<p>Fullscreen magnifier with touchpad / touchscreen gestures.</p>"
+                "<p><b>Use:</b> hold <b>%2 + wheel</b> anywhere to zoom at the cursor, "
+                "or press <b>ACTIVATE (F8)</b> then use the wheel / pinch with no keys. "
+                "<b>+ / -</b> zoom in steps.</p>"
+                "<p><b>Desktop tip:</b> a bare pinch with no key only zooms while ACTIVE "
+                "(or directly over the Magnivo panel). When OFF it is ignored on purpose, "
+                "so use <b>%2 + scroll</b> there.</p>"
+                "<p>Updates are checked automatically and in the <b>Update</b> tab.</p>")
             .arg(QString::fromLatin1(kMagnivoVersion), ZoomMod::name(ZoomMod::load())));
     alay->addWidget(label);
     alay->addStretch(1);
@@ -477,16 +751,22 @@ SettingsDialog::SettingsDialog(QWidget *parent, int initialTab) : QDialog(parent
     m_timer = new QElapsedTimer();
 
     connect(m_checkBtn, &QPushButton::clicked, this, &SettingsDialog::startCheck);
-    connect(m_downloadBtn, &QPushButton::clicked, this, &SettingsDialog::startDownload);
     connect(m_installBtn, &QPushButton::clicked, this, &SettingsDialog::onInstallClicked);
     connect(m_tabs, &QTabWidget::currentChanged, this, &SettingsDialog::onTabChanged);
+    connect(m_themeBox, &OptionDropDown::currentIndexChanged,
+            this, &SettingsDialog::onThemeChanged);
+    applyTheme(Theme::load()); // again now that the dropdowns exist (menu style)
 
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
+    buttons->button(QDialogButtonBox::Ok)->setCursor(Qt::PointingHandCursor);
+    buttons->button(QDialogButtonBox::Cancel)->setCursor(Qt::PointingHandCursor);
+    buttons->button(QDialogButtonBox::Ok)->setToolTip("Save and close");
+    buttons->button(QDialogButtonBox::Cancel)->setToolTip("Close without saving");
     connect(buttons, &QDialogButtonBox::accepted, this, &QDialog::accept);
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
     mainLay->addWidget(buttons);
 
-    setMinimumSize(460, 400);
+    setMinimumSize(480, 420);
     m_tabs->setCurrentIndex(qBound(0, initialTab, 2));
     if (m_tabs->currentIndex() == UpdateTab)
         QTimer::singleShot(0, this, &SettingsDialog::startCheck);
@@ -498,10 +778,12 @@ void SettingsDialog::onTabChanged(int index) {
 }
 
 int SettingsDialog::selectedModifier() const {
-    return m_modBox->currentData().toInt();
+    return m_modBox ? m_modBox->currentData() : ZoomMod::Ctrl;
 }
-QString SettingsDialog::selectedRepo() const {
-    return m_repoEdit->text().trimmed();
+
+int SettingsDialog::selectedTheme() const {
+    int t = m_themeBox ? m_themeBox->currentData() : Theme::Dark;
+    return (t == Theme::Light) ? Theme::Light : Theme::Dark;
 }
 
 // ---------------- Updater logic (lives in SettingsDialog::UpdateTab) ----------------
@@ -526,24 +808,15 @@ QString SettingsDialog::fmtSpeed(double bytesPerSec) {
 void SettingsDialog::startCheck() {
     m_updateChecked = true;
     setStatus("Checking for updates...");
+    m_status->setToolTip("");
     m_checkBtn->setEnabled(false);
-    m_downloadBtn->setEnabled(false);
     m_installBtn->setEnabled(false);
     m_bar->setValue(0);
     m_stats->setText("");
     m_downloadUrl.clear();
     m_latestTag.clear();
 
-    // Prefer the repo currently typed in General tab so users don't have
-    // to press OK first before checking.
-    QString repo = m_repoEdit ? m_repoEdit->text().trimmed() : QString();
-    if (repo.isEmpty())
-        repo = ZoomMod::githubRepo();
-    if (repo.isEmpty()) {
-        setStatus("No GitHub repo set. Enter owner/repo in the General tab first.");
-        m_checkBtn->setEnabled(true);
-        return;
-    }
+    QString repo = QString::fromLatin1(kMagnivoUpdateRepo);
     QUrl url(QString("https://api.github.com/repos/%1/releases/latest").arg(repo));
     QNetworkRequest req(url);
     req.setHeader(QNetworkRequest::UserAgentHeader, "Magnivo-Updater");
@@ -554,39 +827,86 @@ void SettingsDialog::startCheck() {
     connect(m_checkReply, &QNetworkReply::finished, this, &SettingsDialog::onCheckFinished);
 }
 
+void SettingsDialog::showUpdateAvailablePopup(const QString &tag, const QString &notes) {
+    QString text = QString("A new version of Magnivo is available.\n\nYou have v%1, latest is %2.%3\n\nUpdate now?")
+                       .arg(QString::fromLatin1(kMagnivoVersion), tag,
+                            notes.isEmpty() ? QString() : "\n\n" + notes);
+    QMessageBox box(this);
+    box.setWindowTitle("Magnivo update available");
+    box.setStyleSheet(messageBoxStyle(selectedTheme()));
+    box.setText(text);
+    box.setInformativeText("Choose Update to download it now, or Cancel to stay on this version.");
+    QPushButton *updateBtn = box.addButton("Update", QMessageBox::AcceptRole);
+    QPushButton *cancelBtn = box.addButton("Cancel", QMessageBox::RejectRole);
+    updateBtn->setCursor(Qt::PointingHandCursor);
+    cancelBtn->setCursor(Qt::PointingHandCursor);
+    box.setDefaultButton(updateBtn);
+    box.exec();
+    if (box.clickedButton() == updateBtn) {
+        startDownload(); // user chose Update -> download straight away
+    } else {
+#ifdef Q_OS_WIN
+        g_dismissedTag = tag; // don't nag again for this version
+#endif
+    }
+}
+
 void SettingsDialog::onCheckFinished() {
     m_checkBtn->setEnabled(true);
     QNetworkReply *r = m_checkReply;
     m_checkReply = nullptr;
     if (!r) return;
+    // Keep copies for the tooltip/debug BEFORE deleteLater, but never show them.
+    QNetworkReply::NetworkError errCode = r->error();
+    int httpCode = r->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+    QString techDetail = QString("Update check failed: %1 (code %2, http %3)")
+                             .arg(r->errorString()).arg(int(errCode)).arg(httpCode);
     r->deleteLater();
-    if (r->error() != QNetworkReply::NoError) {
-        setStatus(QString("Check failed: %1").arg(r->errorString()));
+    if (errCode != QNetworkReply::NoError) {
+        qDebug() << "Magnivo:" << techDetail;
+        QString friendly;
+        if (httpCode == 404)
+            friendly = QString("No releases published yet, so you're up to date.");
+        else if (httpCode == 403 || httpCode == 429)
+            friendly = QString("GitHub is busy right now. Try again in a bit.");
+        else if (errCode == QNetworkReply::HostNotFoundError ||
+                 errCode == QNetworkReply::TimeoutError ||
+                 errCode == QNetworkReply::ConnectionRefusedError ||
+                 errCode == QNetworkReply::UnknownNetworkError)
+            friendly = QString("Couldn't reach the update server. Check your internet and try again.");
+        else
+            friendly = QString("Couldn't check for updates. Try again in a bit.");
+        setStatus(friendly);
+        m_status->setToolTip(techDetail);
+        m_detail->setText(QString("Current version: v%1").arg(QString::fromLatin1(kMagnivoVersion)));
         return;
     }
     QJsonParseError perr{};
     QJsonDocument doc = QJsonDocument::fromJson(r->readAll(), &perr);
     if (perr.error != QJsonParseError::NoError || !doc.isObject()) {
-        setStatus("Check failed: bad response from GitHub.");
+        setStatus("Couldn't check for updates (bad response). Try again later.");
         return;
     }
     QJsonObject obj = doc.object();
     QString tag = obj.value("tag_name").toString().trimmed(); // e.g. "v1.1.0"
     if (tag.isEmpty()) {
-        setStatus("Check failed: release has no tag_name.");
+        // No releases published yet -> we are trivially on the latest.
+        setStatus("You're up to date.");
+        m_detail->setText(QString("Current version: v%1  •  Latest version: v%1").arg(QString::fromLatin1(kMagnivoVersion)));
         return;
     }
     m_latestTag = tag;
     QString cleanLatest = tag.startsWith('v') || tag.startsWith('V') ? tag.mid(1) : tag;
     QVersionNumber cur = QVersionNumber::fromString(QString::fromLatin1(kMagnivoVersion));
     QVersionNumber lat = QVersionNumber::fromString(cleanLatest);
-    QString body = obj.value("body").toString();
-    if (body.length() > 220) body = body.left(220) + "...";
-    m_detail->setText(QString("Current: v%1   •   Latest: %2%3")
+    QString body = obj.value("body").toString().trimmed();
+    QString shortNotes = body;
+    if (shortNotes.length() > 220) shortNotes = shortNotes.left(220) + "...";
+    m_detail->setText(QString("Current version: v%1   •   Latest version: %2%3")
                           .arg(QString::fromLatin1(kMagnivoVersion), tag,
-                               body.isEmpty() ? "" : "\n" + body));
+                               shortNotes.isEmpty() ? "" : "\n" + shortNotes));
     if (!lat.isNull() && !cur.isNull() && lat <= cur) {
-        setStatus("You're up to date.");
+        setStatus("You're up to date. You have the latest version.");
         return;
     }
     // Pick a downloadable asset: prefer .exe, then .msi, then .zip
@@ -620,23 +940,32 @@ void SettingsDialog::onCheckFinished() {
         }
     }
     if (bestUrl.isEmpty()) {
-        setStatus(QString("Update %1 found, but it has no downloadable file.").arg(tag));
+        setStatus(QString("Update %1 is available, but it has no downloadable file.").arg(tag));
         return;
     }
     m_downloadUrl = bestUrl;
     m_fileName = bestName.isEmpty() ? QString("Magnivo-%1-update").arg(tag) : bestName;
     m_assetSize = bestSize;
-    setStatus(QString("Update available: %1 (%2)").arg(tag, bestName));
+    setStatus(QString("New update available: %1").arg(tag));
     m_stats->setText(bestSize > 0 ? QString("Size: %1").arg(fmtSize(bestSize)) : "");
-    m_downloadBtn->setEnabled(true);
+#ifdef Q_OS_WIN
+    // If the startup monitor already asked about this exact version and the
+    // user pressed Update, skip the second popup and download immediately.
+    if (!g_notifiedTag.isEmpty() && g_notifiedTag == tag) {
+        g_notifiedTag.clear();
+        startDownload();
+        return;
+    }
+#endif
+    showUpdateAvailablePopup(tag, shortNotes);
 }
 
 void SettingsDialog::startDownload() {
     if (m_downloadUrl.isEmpty()) return;
-    m_downloadBtn->setEnabled(false);
+    m_checkBtn->setEnabled(false);
     m_installBtn->setEnabled(false);
     m_bar->setValue(0);
-    m_stats->setText("Starting...");
+    m_stats->setText("Starting download...");
 
     QString dir = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
     if (dir.isEmpty()) dir = QDir::tempPath();
@@ -645,9 +974,9 @@ void SettingsDialog::startDownload() {
     if (m_file) { m_file->deleteLater(); m_file = nullptr; }
     m_file = new QFile(m_savePath, this);
     if (!m_file->open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        setStatus("Cannot write file: " + m_savePath);
+        setStatus("Couldn't save the download here: " + m_savePath);
         m_file->deleteLater(); m_file = nullptr;
-        m_downloadBtn->setEnabled(true);
+        m_checkBtn->setEnabled(true);
         return;
     }
     QNetworkRequest req{QUrl(m_downloadUrl)};
@@ -695,19 +1024,22 @@ void SettingsDialog::onDownloadFinished() {
         m_file->close();
     }
     bool ok = (r->error() == QNetworkReply::NoError);
-    QString err = r->errorString();
+    QString techDlDetail = r->errorString();
     r->deleteLater();
     if (!ok) {
-        setStatus(QString("Download failed: %1").arg(err));
-        m_downloadBtn->setEnabled(true);
+        qDebug() << "Magnivo: download failed:" << techDlDetail;
+        setStatus("Download didn't finish. Check your connection and press \"Check for updates\" to try again.");
+        m_status->setToolTip(QString("Download failed: %1").arg(techDlDetail));
+        m_checkBtn->setEnabled(true);
         return;
     }
     QFileInfo fi(m_savePath);
     m_bar->setValue(100);
     m_stats->setText(QString("%1 downloaded").arg(fmtSize(fi.size())));
-    setStatus("Download complete: " + fi.fileName() + "\nSaved to: " + m_savePath);
+    setStatus("Download complete. Press \"Install && Restart\" to update.");
     m_installBtn->setEnabled(true);
-    m_downloadBtn->setEnabled(false);
+    m_checkBtn->setEnabled(true);
+    m_installBtn->setFocus();
 }
 
 void SettingsDialog::onInstallClicked() {
@@ -778,13 +1110,21 @@ Magnivo::Magnivo(QObject *parent) : QObject(parent) {
     // NOTE: no applyTransform() here on purpose. Screen stays untouched
     // until the user arms with ACTIVATE/F8/<Mod>+wheel. This avoids
     // black-on-launch.
+
+    // Background update monitor: check once shortly after startup. If a new
+    // release exists, pop up "Update or Cancel". Silent when up to date.
+    QTimer::singleShot(4000, this, &Magnivo::scheduleAutoUpdateCheck);
 }
 
 Magnivo::~Magnivo() {
 #ifdef Q_OS_WIN
+    if (m_updateReply) { m_updateReply->abort(); m_updateReply->deleteLater(); m_updateReply = nullptr; }
+#endif
+#ifdef Q_OS_WIN
     // Back to normal only if we actually zoomed.
     if (m_magOk && m_transformActive) {
         magSetFullscreenTransform(1.0f, 0, 0);
+        if (pMagSetInputTransform) pMagSetInputTransform(FALSE, nullptr, nullptr);
         m_transformActive = false;
     }
     if (m_magOk) magUninitialize();
@@ -834,6 +1174,27 @@ void Magnivo::zoomOut() {
     if (m_zoom <= 1.001f) setArmed(false);
 }
 
+void Magnivo::zoomByWheelDelta(int wheelDelta) {
+    // Smooth proportional step so a pinch/scroll in followed by the same
+    // amount out lands back where it started. One classic notch (120)
+    // is ~15%: 1.00 -> 1.15 -> 1.32 ... up to 8x. High-res touchpad
+    // deltas (e.g. 10-30) give tiny smooth steps instead of full jumps.
+    if (wheelDelta == 0) return;
+    double steps = double(wheelDelta) / 120.0;
+    double factor = std::pow(1.15, steps);
+    if (!(factor > 0.0) || !(factor < 100.0)) return; // paranoia for bad input
+    float target = float(double(m_zoom) * factor);
+    // Wheel-out all the way to 100% means OFF (screen back to normal).
+    // Wheel-in from OFF auto-arms via setZoom().
+    if (target <= 1.001f) {
+        if (!m_armed && m_zoom <= 1.001f) return; // already OFF, nothing to do
+        setZoom(1.0f);
+        setArmed(false);
+        return;
+    }
+    setZoom(target);
+}
+
 void Magnivo::setArmed(bool armed) {
     if (m_armed == armed) { applyTransform(); return; }
     m_armed = armed;
@@ -859,7 +1220,9 @@ void Magnivo::openSettingsTab(int tab) {
     if (dlg.exec() == QDialog::Accepted) {
         int vk = dlg.selectedModifier();
         ZoomMod::save(vk);
-        ZoomMod::setGithubRepo(dlg.selectedRepo());
+        int theme = dlg.selectedTheme();
+        Theme::save(theme);
+        m_panel->applyTheme(theme);
 #ifdef Q_OS_WIN
         g_zoomModVk = vk;
 #endif
@@ -887,16 +1250,87 @@ void Magnivo::tick() {
     // No hide/show, no grabWindow here - that's what caused the blinking.
     // We just move the GPU transform so the cursor stays centered.
     applyTransform();
+    // Watchdog: Windows silently drops low-level hooks if our thread ever
+    // blocks past LowLevelHooksTimeout. If a handle went null, reinstall so
+    // <Mod>+wheel never mysteriously stops working until restart.
+    ++m_tickCount;
+    if ((m_tickCount % 300) == 0) // ~every 5s at 60fps
+        ensureHooksInstalled();
+}
+
+void Magnivo::scheduleAutoUpdateCheck() {
+    if (m_updateNam == nullptr)
+        m_updateNam = new QNetworkAccessManager(this);
+    if (m_updateReply) { m_updateReply->abort(); m_updateReply->deleteLater(); m_updateReply = nullptr; }
+    QUrl url(QString("https://api.github.com/repos/%1/releases/latest")
+                 .arg(QString::fromLatin1(kMagnivoUpdateRepo)));
+    QNetworkRequest req(url);
+    req.setHeader(QNetworkRequest::UserAgentHeader, "Magnivo-Updater");
+    req.setRawHeader("Accept", "application/vnd.github+json");
+    req.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
+    m_updateReply = m_updateNam->get(req);
+    connect(m_updateReply, &QNetworkReply::finished, this, &Magnivo::onAutoUpdateCheckFinished);
+}
+
+void Magnivo::onAutoUpdateCheckFinished() {
+    QNetworkReply *r = m_updateReply;
+    m_updateReply = nullptr;
+    if (!r) return;
+    r->deleteLater();
+    if (r->error() != QNetworkReply::NoError) return; // silent when offline
+    QJsonParseError perr{};
+    QJsonDocument doc = QJsonDocument::fromJson(r->readAll(), &perr);
+    if (perr.error != QJsonParseError::NoError || !doc.isObject()) return;
+    QString tag = doc.object().value("tag_name").toString().trimmed();
+    if (tag.isEmpty()) return;
+    QString clean = tag.startsWith('v') || tag.startsWith('V') ? tag.mid(1) : tag;
+    QVersionNumber cur = QVersionNumber::fromString(QString::fromLatin1(kMagnivoVersion));
+    QVersionNumber lat = QVersionNumber::fromString(clean);
+    if (cur.isNull() || lat.isNull() || lat <= cur) return; // up to date: stay silent
+#ifdef Q_OS_WIN
+    if (!g_dismissedTag.isEmpty() && g_dismissedTag == tag) return; // user said Cancel
+    if (!g_notifiedTag.isEmpty() && g_notifiedTag == tag) return; // already asked
+    g_notifiedTag = tag;
+#endif
+    QString body = doc.object().value("body").toString().trimmed();
+    if (body.length() > 240) body = body.left(240) + "...";
+    QMessageBox box(m_panel);
+    box.setWindowTitle("Magnivo update available");
+    box.setStyleSheet(SettingsDialog::messageBoxStyle(Theme::load()));
+    box.setText(QString("You have an update available.\n\nInstalled: v%1   •   Latest: %2%3\n\nUpdate now?")
+                    .arg(QString::fromLatin1(kMagnivoVersion), tag,
+                         body.isEmpty() ? QString() : "\n\n" + body));
+    box.setInformativeText("Choose Update to download it, or Cancel to stay on this version.");
+    QPushButton *updateBtn = box.addButton("Update", QMessageBox::AcceptRole);
+    QPushButton *cancelBtn = box.addButton("Cancel", QMessageBox::RejectRole);
+    updateBtn->setCursor(Qt::PointingHandCursor);
+    cancelBtn->setCursor(Qt::PointingHandCursor);
+    box.setDefaultButton(updateBtn);
+    box.exec();
+    if (box.clickedButton() == updateBtn) {
+        openSettingsTab(SettingsDialog::UpdateTab); // auto-downloads (see g_notifiedTag)
+    } else {
+#ifdef Q_OS_WIN
+        g_dismissedTag = tag;
+        g_notifiedTag.clear();
+#endif
+    }
 }
 
 void Magnivo::applyTransform() {
 #ifdef Q_OS_WIN
     if (!m_magOk) return;
+    auto resetView = []() {
+        magSetFullscreenTransform(1.0f, 0, 0);
+        // Touch/pen taps are mapped into the magnified view while zoomed;
+        // switch that mapping off again so taps land 1:1 when normal.
+        if (pMagSetInputTransform) pMagSetInputTransform(FALSE, nullptr, nullptr);
+    };
     if (!m_armed) {
         // Only reset once - spamming MagSetFullscreenTransform(1.0) at 60fps
         // is wasteful. m_transformActive tracks whether a zoom is live.
         if (m_transformActive) {
-            magSetFullscreenTransform(1.0f, 0, 0);
+            resetView();
             m_transformActive = false;
         }
         return;
@@ -910,7 +1344,7 @@ void Magnivo::applyTransform() {
     // untouched instead of spamming an identity transform at 60fps.
     if (mag <= 1.001f) {
         if (m_transformActive) {
-            magSetFullscreenTransform(1.0f, 0, 0);
+            resetView();
             m_transformActive = false;
         }
         return;
@@ -936,16 +1370,43 @@ void Magnivo::applyTransform() {
     if (yMax < 0) yMax = 0;
     xOff = qBound(0, xOff, xMax);
     yOff = qBound(0, yOff, yMax);
-    if (magSetFullscreenTransform(mag, xOff, yOff))
+    if (magSetFullscreenTransform(mag, xOff, yOff)) {
         m_transformActive = true;
+        // Map touch/pen input into the zoomed view: without this a tap on the
+        // VISIBLE (magnified) X/minimize/file lands at the raw unmagnified
+        // point instead, so taps miss while zoomed (mouse is unaffected, it
+        // only needs this for pen/touch). Near the screen center the error is
+        // tiny, which is why taps sometimes seemed to work and sometimes not.
+        if (pMagSetInputTransform) {
+            RECT src{ xOff, yOff, xOff + viewW, yOff + viewH };
+            RECT dst{ 0, 0, sw, sh };
+            pMagSetInputTransform(TRUE, &src, &dst);
+        }
+    }
 #endif
 }
 
 void Magnivo::installGlobalHooks() {
 #ifdef Q_OS_WIN
     g_inst = this;
-    g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, GetModuleHandleW(nullptr), 0);
-    g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, KbProc, GetModuleHandleW(nullptr), 0);
+    if (!g_mouseHook)
+        g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, GetModuleHandleW(nullptr), 0);
+    if (!g_kbHook)
+        g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, KbProc, GetModuleHandleW(nullptr), 0);
+    qDebug() << "Magnivo: hooks installed. mouse =" << (void*)g_mouseHook
+             << "kb =" << (void*)g_kbHook << "err =" << (int)GetLastError();
+#endif
+}
+
+void Magnivo::ensureHooksInstalled() {
+#ifdef Q_OS_WIN
+    // Only reinstall handles that actually went null. (Windows can silently
+    // drop a low-level hook after a timeout; reinstalling restores zoom.)
+    if (g_inst != this) g_inst = this;
+    if (!g_mouseHook)
+        g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, GetModuleHandleW(nullptr), 0);
+    if (!g_kbHook)
+        g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, KbProc, GetModuleHandleW(nullptr), 0);
 #endif
 }
 

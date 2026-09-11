@@ -3,10 +3,17 @@
 #include <QWidget>
 #include <QLabel>
 #include <QDialog>
+#include <QColor>
+#include <QPushButton>
+#include <QList>
 
 // App version shown in About + used by the in-app updater to compare
 // against the latest GitHub release tag (e.g. "v1.1.0").
 static const char *kMagnivoVersion = "1.0.0";
+
+// GitHub repo used by the updater. Hardcoded so users never have to type it.
+// Releases in this repo are checked on startup + via Settings > Update.
+static const char *kMagnivoUpdateRepo = "Dabbeh/Magnivo";
 
 // Virtual-key codes for the configurable zoom modifier (Windows).
 // Kept as plain ints so the header stays portable (no windows.h here).
@@ -19,9 +26,45 @@ const int Win   = 0x5B;
 int load();                 // read from QSettings, default Ctrl
 void save(int vk);          // persist to QSettings
 QString name(int vk);       // "Ctrl" / "Alt" / "Shift" / "Win"
-QString githubRepo();       // "owner/repo" from QSettings (editable in Settings)
+// NOTE: update repo is now hardcoded (kMagnivoUpdateRepo). These helpers stay
+// only so old settings files don't break; the Settings UI no longer shows them.
+QString githubRepo();       // returns kMagnivoUpdateRepo (legacy override ignored)
 void setGithubRepo(const QString &repo);
 }
+
+// Settings appearance (Settings dialog + its popups). Dark by default to
+// match the control panel; Light available in General tab. Persisted.
+namespace Theme {
+const int Dark  = 0;
+const int Light = 1;
+int load();          // read from QSettings, default Dark
+void save(int theme);
+}
+
+// Button-style dropdown used in Settings instead of QComboBox: the value plus
+// a text arrow that is always visible in both themes, opening a popup menu.
+class OptionDropDown : public QPushButton {
+    Q_OBJECT
+public:
+    explicit OptionDropDown(QWidget *parent = nullptr);
+    void addItem(const QString &text, int data);
+    int findData(int data) const;
+    int currentData() const;
+    int currentIndex() const;
+    void setCurrentIndex(int i);
+    void setMenuStyleSheet(const QString &st);
+
+signals:
+    void currentIndexChanged(int index);
+
+private:
+    struct Item { QString text; int data; };
+    void refreshText();
+    void showMenu();
+    QList<Item> m_items;
+    int m_cur = -1;
+    QString m_menuStyle;
+};
 
 // Small control bar. This is the ONLY Qt window now.
 // Fullscreen zoom itself is done by Windows Magnification API (GPU, no flicker).
@@ -35,6 +78,7 @@ public slots:
     void setZoom(float zoom);
     void setArmed(bool armed);
     void setModifierName(const QString &modName);
+    void applyTheme(int theme); // dark/light panel, follows Settings > Appearance
 
 signals:
     void pinchDelta(double delta);  // touchpad swipe in/out over panel
@@ -49,32 +93,46 @@ signals:
 
 protected:
     bool event(QEvent *e) override;
+    void paintEvent(QPaintEvent *e) override;
     void mousePressEvent(QMouseEvent *e) override;
     void mouseMoveEvent(QMouseEvent *e) override;
 
 private:
+    void refreshArmButton(); // restyle ACTIVATE for current theme + armed state
     QLabel *m_label = nullptr;
+    QLabel *m_titleName = nullptr;
     class QPushButton *m_armBtn = nullptr;
+    class QPushButton *m_closeBtn = nullptr;
+    class QPushButton *m_settingsBtn = nullptr;
+    int m_theme = 0; // Theme::Dark; applied in constructor via applyTheme()
+    QColor m_bgColor = QColor("#1e1e1e"); // panel fill, painted in paintEvent
+    QColor m_borderColor = QColor("#555555");
     QPoint m_dragPos;
     bool m_touchActive = false;
     double m_touchLastDist = 0.0;
     QString m_modName = "Ctrl";
 };
 
-// Unified settings: General (modifier + repo) | Update (in-app updater) | About.
-// Opened via the single gear icon on the control panel. This replaces the old
-// separate Settings / Update / About buttons.
+// Unified settings: General (modifier) | Update (in-app updater) | About.
+// Opened via the single gear icon on the control panel. Kept intentionally
+// simple: one control per tab, big status text, OK/Cancel with hover feedback.
 class SettingsDialog : public QDialog {
     Q_OBJECT
 public:
     enum Tab { GeneralTab = 0, UpdateTab = 1, AboutTab = 2 };
     explicit SettingsDialog(QWidget *parent = nullptr, int initialTab = GeneralTab);
     int selectedModifier() const;
-    QString selectedRepo() const;
+    int selectedTheme() const;
+    static QString messageBoxStyle(int theme); // matching popup stylesheet (also used by startup monitor)
 
 private slots:
-    // In-app updater (Update tab): checks GitHub releases, downloads with
-    // progress + speed, then runs installer. Says "You're up to date" if current.
+    void onThemeChanged(int index);
+
+private slots:
+    // In-app updater (Update tab): checks GitHub releases for
+    // kMagnivoUpdateRepo, shows "You're up to date" or pops up
+    // "New update available" with Update/Cancel. Update auto-downloads
+    // with progress, then enables Install & Restart.
     void startCheck();
     void onCheckFinished();
     void startDownload();
@@ -85,20 +143,23 @@ private slots:
 
 private:
     void setStatus(const QString &t);
+    void showUpdateAvailablePopup(const QString &tag, const QString &notes);
+    void applyTheme(int theme); // live preview: swaps the whole dialog stylesheet
+    static QString settingsStyle(int theme); // full dialog stylesheet, dark or light
+    static QString menuStyle(int theme); // popup-menu stylesheet for the dropdowns
     static QString fmtSize(qint64 bytes);
     static QString fmtSpeed(double bytesPerSec);
 
     class QTabWidget *m_tabs = nullptr;
     // General tab
-    class QComboBox *m_modBox = nullptr;
-    class QLineEdit *m_repoEdit = nullptr;
+    OptionDropDown *m_modBox = nullptr;
+    OptionDropDown *m_themeBox = nullptr;
     // Update tab
     QLabel *m_status = nullptr;
     QLabel *m_detail = nullptr;
     QLabel *m_stats = nullptr;
     class QProgressBar *m_bar = nullptr;
     class QPushButton *m_checkBtn = nullptr;
-    class QPushButton *m_downloadBtn = nullptr;
     class QPushButton *m_installBtn = nullptr;
     class QNetworkAccessManager *m_nam = nullptr;
     class QNetworkReply *m_checkReply = nullptr;
@@ -131,6 +192,7 @@ public slots:
     void setZoom(float z);
     void zoomIn();
     void zoomOut();
+    void zoomByWheelDelta(int wheelDelta); // smooth proportional wheel/pinch step
     void setArmed(bool armed);
     void toggleArmed();
     void openSettings();
@@ -140,6 +202,8 @@ public slots:
 
 private slots:
     void tick();
+    void scheduleAutoUpdateCheck();
+    void onAutoUpdateCheckFinished();
 
 private:
     // Starts at 100% so ACTIVATE arms gestures WITHOUT zooming.
@@ -150,8 +214,13 @@ private:
     class QTimer *m_timer = nullptr;
     bool m_magOk = false;
     bool m_transformActive = false; // true once we actually zoomed (for safe reset)
+    qint64 m_tickCount = 0; // watchdog counter for hook reinstall
     void applyTransform();
     void installGlobalHooks();
     void uninstallGlobalHooks();
+    void ensureHooksInstalled(); // watchdog: reinstall if Windows dropped them
     bool gestureAllowed() const; // armed OR zoom-modifier held
+    // Background update monitor (startup check with popup on new release).
+    class QNetworkAccessManager *m_updateNam = nullptr;
+    class QNetworkReply *m_updateReply = nullptr;
 };
