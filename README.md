@@ -1,2 +1,73 @@
 # Magnivo
-Lightweight desktop screen magnifier with gesture, mouse, and keyboard zoom controls.
+
+Lightweight fullscreen screen magnifier for Windows, like the built-in
+Windows Magnifier, but controlled with mouse wheel, touchpad scroll and
+touchscreen pinch gestures. Zooms the whole desktop (100%–800%) with a
+small floating control panel, using the Windows Magnification API
+(GPU, no flicker, no screenshots).
+
+## Controls
+
+| Action | What happens |
+|---|---|
+| `Ctrl` + wheel / two-finger scroll (anywhere) | Zoom at the cursor (auto-arms) |
+| `ACTIVATE` button, `F8` or `Ctrl+Alt+M` | Arm/disarm gesture mode |
+| Wheel / pinch while ACTIVE (green) | Zoom with no key held |
+| `+` / `-` buttons | Zoom in steps (auto-arm) |
+| Gear icon | Settings: zoom key, dark/light look, updates, about |
+| `Esc` / `X` | Close, screen back to normal |
+
+The zoom key (`Ctrl`, `Alt`, `Shift`, `Win`) is remappable in
+Settings → General. On the bare desktop, pinch only zooms while ACTIVE
+(or directly over the panel) — when OFF it is ignored so you never zoom
+by accident.
+
+## Requirements
+
+- Windows 10/11, Qt 6 (Widgets + Network), MinGW, CMake, Ninja
+- Optional: Inno Setup 6 (to build the installer)
+
+## Build (release)
+
+```powershell
+$env:PATH = "C:\Qt\Tools\Ninja;C:\Qt\Tools\mingw1310_64\bin;C:\Qt\Tools\CMake_64\bin;" + $env:PATH
+cmake -S . -B build\rel -G Ninja -DCMAKE_PREFIX_PATH=C:\Qt\6.10.0\mingw_64 -DCMAKE_BUILD_TYPE=Release
+cmake --build build\rel
+.\build\rel\Magnivo.exe
+```
+
+## Installer
+
+```powershell
+mkdir deploy
+copy build\rel\Magnivo.exe deploy\
+C:\Qt\6.10.0\mingw_64\bin\windeployqt.exe --release --no-translations deploy\Magnivo.exe
+& "${env:LOCALAPPDATA}\Programs\Inno Setup 6\ISCC.exe" installer\Magnivo.iss
+```
+
+Result: `installer\Output\Magnivo-Setup-<version>.exe` (see
+`installer\Magnivo.iss` for the icon wiring and details).
+
+## Updates
+
+The app checks its GitHub releases (`Dabbeh/Magnivo`) on start-up and in
+Settings → Update. If a newer release with a downloadable file exists,
+it asks Update/Cancel, downloads with progress, then offers
+Install && Restart. Publish a new `vX.Y.Z` tag with an `.exe` asset and
+bump `kMagnivoVersion` in `Magnivo.h` to ship an update.
+
+## Project layout
+
+| File | Purpose |
+|---|---|
+| `main.cpp` | Entry point, starts the app |
+| `Magnivo.h` / `Magnivo.cpp` | All logic: panel, settings, hooks, zoom, updater |
+| `CMakeLists.txt` | Build recipe |
+| `Magnivo.qrc` | Embeds `assets/logo.png` as `:/logo.png` |
+| `Magnivo.rc` | Exe icon + version info |
+| `assets/` | `logo.ico` (7 sizes), `logo.png`, `logo.svg` |
+| `installer/Magnivo.iss` | Inno Setup installer script |
+
+## License
+
+See [LICENSE](LICENSE).

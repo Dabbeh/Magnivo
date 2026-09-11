@@ -33,8 +33,13 @@ qrc_*
 *.zip
 Magnivo-*-update*
 
+# windeployqt staging + compiled installer (regenerated, see installer/*.iss)
+deploy/
+installer/Output/
+
 # OS / editor junk
 Thumbs.db
 Desktop.ini
 .vscode/
+.vs/
 .idea/
