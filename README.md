@@ -6,6 +6,23 @@ touchscreen pinch gestures. Zooms the whole desktop (100%–800%) with a
 small floating control panel, using the Windows Magnification API
 (GPU, no flicker, no screenshots).
 
+## Screenshots
+
+![Main panel - OFF](docs/screenshots/panel-off.png)
+*Floating panel when OFF — press ACTIVATE (F8) to arm gestures.*
+
+![Main panel - ACTIVE at 305%](docs/screenshots/panel-active.png)
+*When ACTIVE (green) — wheel / pinch zooms with no key, `+` / `-` step.*
+
+![Settings - General](docs/screenshots/settings-general.png)
+*Settings → General: remappable zoom key + Dark / Light appearance.*
+
+![Settings - Update](docs/screenshots/settings-update.png)
+*Settings → Update: automatic check, download with progress, Install & Restart.*
+
+![Settings - About](docs/screenshots/settings-about.png)
+*Settings → About: version, usage and desktop pinch tip.*
+
 ## Controls
 
 | Action | What happens |
