@@ -47,7 +47,7 @@ jobs:
           windeployqt --release --no-translations deploy/Magnivo.exe
 
       - name: Compile installer (Inno Setup)
-        uses: Minionguyjpro/Inno-Setup-Action@v1.2.9
+        uses: Minionguyjpro/Inno-Setup-Action@ec985ef724d1fb4a05bfbc1a8e49930dc76d2b0c
         with:
           path: installer/Magnivo.iss
 
