@@ -9,7 +9,7 @@
 
 // App version shown in About + used by the in-app updater to compare
 // against the latest GitHub release tag (e.g. "v1.1.0").
-static const char *kMagnivoVersion = "1.0.0";
+static const char *kMagnivoVersion = "1.1.0";
 
 // GitHub repo used by the updater. Hardcoded so users never have to type it.
 // Releases in this repo are checked on startup + via Settings > Update.
@@ -40,6 +40,15 @@ const int Light = 1;
 int load();          // read from QSettings, default Dark
 void save(int theme);
 }
+
+// Integer rect in physical screen pixels. Caches the last-applied
+// magnification source/destination rects (kept portable: no windows.h here;
+// converted to RECT at the call site in Magnivo.cpp).
+struct MagRect {
+    int l = 0, t = 0, r = 0, b = 0;
+    bool operator==(const MagRect &o) const { return l == o.l && t == o.t && r == o.r && b == o.b; }
+    bool operator!=(const MagRect &o) const { return !(*this == o); }
+};
 
 // Button-style dropdown used in Settings instead of QComboBox: the value plus
 // a text arrow that is always visible in both themes, opening a popup menu.
@@ -214,6 +223,18 @@ private:
     class QTimer *m_timer = nullptr;
     bool m_magOk = false;
     bool m_transformActive = false; // true once we actually zoomed (for safe reset)
+    // Last applied transform: skip redundant driver calls from the 60fps
+    // tick when the cursor didn't move, and only refresh the touch/pen
+    // input mapping when the view rect actually changes.
+    float m_lastMag = 0.0f;
+    int m_lastXOff = 0, m_lastYOff = 0;
+    int m_sameCount = 0; // ticks since the view last changed (self-heal ~1x/s)
+    bool m_inputOn = false; // MagSetInputTransform currently active
+    bool m_inputWarned = false; // logged the UIAccess limitation once
+    MagRect m_lastSrc, m_lastDst;
+    class QDialog *m_settingsDlg = nullptr; // open settings window (if any)
+    void applyWindowFilter(); // keep our own windows unmagnified + clickable
+    void updateInputTransform(bool wantOn, const MagRect &src, const MagRect &dst);
     qint64 m_tickCount = 0; // watchdog counter for hook reinstall
     void applyTransform();
     void installGlobalHooks();

@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity version="1.0.0.0" processorArchitecture="*" name="Magnivo.Magnivo" type="win32"/>
+  <description>Magnivo screen magnifier</description>
+  <!-- Per-Monitor V2 DPI awareness is REQUIRED for correct magnification:
+       MagSetFullscreenTransform offsets are documented as DPI-independent
+       (physical pixels), and the Microsoft fullscreen-magnifier sample notes
+       its GetSystemMetrics(SM_CXSCREEN/...) math assumes those values are
+       unaffected by DPI - guaranteed only via a DPI-aware manifest.
+       Without this, on >100% display scaling the zoom rect is computed in
+       virtualized coordinates: blurry/pixelated output AND misaligned
+       cursor tracking / input mapping (clicks land in the wrong place).
+       NOTE: uiAccess is deliberately NOT requested here: it would refuse to
+       launch unless the exe is signed and installed in a secure location. -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">True/PM</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2, PerMonitor, System</dpiAwareness>
+    </windowsSettings>
+  </application>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10 / 11 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+      <!-- Windows 8.1 -->
+      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/>
+      <!-- Windows 8 -->
+      <supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a6a6e38}"/>
+      <!-- Windows 7 -->
+      <supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}"/>
+      <!-- Windows Vista -->
+      <supportedOS Id="{e2011457-1546-43c5-a5fe-008deee3d3f0}"/>
+    </application>
+  </compatibility>
+</assembly>

@@ -61,6 +61,7 @@ typedef BOOL (WINAPI *PFN_MagUninitialize)(void);
 typedef BOOL (WINAPI *PFN_MagSetFullscreenTransform)(float, int, int);
 typedef BOOL (WINAPI *PFN_MagSetWindowFilterList)(HWND, DWORD, int, HWND*);
 typedef BOOL (WINAPI *PFN_MagSetInputTransform)(BOOL, const RECT*, const RECT*);
+typedef BOOL (WINAPI *PFN_MagSetFullscreenUseBitmapSmoothing)(BOOL);
 struct MagColorEffect { float transform[5][5]; };
 typedef BOOL (WINAPI *PFN_MagSetFullscreenColorEffect)(MagColorEffect*);
 
@@ -71,6 +72,7 @@ static PFN_MagSetFullscreenTransform pMagSetFullscreenTransform = nullptr;
 static PFN_MagSetWindowFilterList pMagSetWindowFilterList = nullptr;
 static PFN_MagSetFullscreenColorEffect pMagSetFullscreenColorEffect = nullptr;
 static PFN_MagSetInputTransform pMagSetInputTransform = nullptr;
+static PFN_MagSetFullscreenUseBitmapSmoothing pMagSetFullscreenUseBitmapSmoothing = nullptr;
 
 static bool magLoad() {
     if (g_magDll) return pMagInitialize != nullptr;
@@ -82,12 +84,20 @@ static bool magLoad() {
     pMagSetWindowFilterList = (PFN_MagSetWindowFilterList)GetProcAddress(g_magDll, "MagSetWindowFilterList");
     pMagSetFullscreenColorEffect = (PFN_MagSetFullscreenColorEffect)GetProcAddress(g_magDll, "MagSetFullscreenColorEffect");
     pMagSetInputTransform = (PFN_MagSetInputTransform)GetProcAddress(g_magDll, "MagSetInputTransform");
+    // Undocumented but used by Magnify.exe itself (see its imports): enables
+    // the "Smooth edges of images and text" filtering for fullscreen zoom.
+    // Without this, MagSetFullscreenTransform alone looks blocky/pixelated
+    // next to Windows Magnifier. Best-effort: missing on old Windows -> stays off.
+    pMagSetFullscreenUseBitmapSmoothing = (PFN_MagSetFullscreenUseBitmapSmoothing)GetProcAddress(g_magDll, "MagSetFullscreenUseBitmapSmoothing");
     if (!pMagInitialize || !pMagUninitialize || !pMagSetFullscreenTransform)
         qWarning() << "Magnivo: GetProcAddress failed for Mag API";
     return pMagInitialize && pMagUninitialize && pMagSetFullscreenTransform;
 }
 static BOOL magInitialize() { return (magLoad() && pMagInitialize) ? pMagInitialize() : FALSE; }
 static BOOL magUninitialize() { return pMagUninitialize ? pMagUninitialize() : FALSE; }
+static BOOL magSetFullscreenUseBitmapSmoothing(BOOL on) {
+    return pMagSetFullscreenUseBitmapSmoothing ? pMagSetFullscreenUseBitmapSmoothing(on) : FALSE;
+}
 static BOOL magSetFullscreenTransform(float m, int x, int y) {
     return pMagSetFullscreenTransform ? pMagSetFullscreenTransform(m, x, y) : FALSE;
 }
@@ -185,6 +195,7 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (isWheel) {
         MSLLHOOKSTRUCT *ms = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
         bool modHeld = isZoomModHeld();
+        bool armed = g_inst->armed();
         // When ACTIVE, plain wheel also zooms (that's what ACTIVE means:
         // gestures hijack the wheel until you press F8 again). When OFF,
         // only <Modifier>+wheel zooms so normal scrolling is untouched.
@@ -192,7 +203,6 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
         // own per-app zoom (browser 150% etc.) while Magnivo zooms system-wide.
         // That split-brain (app zoomed, Magnivo at 100%) was the old
         // "zoomed in some app but can't zoom out" bug.
-        bool armed = g_inst->armed();
         if (modHeld || armed) {
             int delta = (short)HIWORD(ms->mouseData);
             if (delta != 0) {
@@ -507,9 +517,16 @@ bool ControlPanel::event(QEvent *e) {
                 if (f > 0.5 && f < 2.0 && qAbs(f - 1.0) > 0.002) emit pinchScale(f);
                 m_touchLastDist = dist;
             }
-        } else { m_touchActive = false; m_touchLastDist = 0; }
-        e->accept();
-        return true;
+            e->accept();
+            return true;
+        }
+        // NOT a 2-finger pinch: reset pinch state and let the event through
+        // so Qt synthesizes a normal mouse click. Accepting single-finger
+        // touches here used to swallow taps, making the panel's own buttons
+        // (X, +, -, ACTIVATE, gear) untappable on touchscreens.
+        m_touchActive = false;
+        m_touchLastDist = 0;
+        return QWidget::event(e);
     }
     return QWidget::event(e);
 }
@@ -1083,6 +1100,14 @@ Magnivo::Magnivo(QObject *parent) : QObject(parent) {
 #ifdef Q_OS_WIN
     m_magOk = magInitialize();
     qDebug() << "Magnivo: MagInitialize ok =" << m_magOk << "err =" << (m_magOk ? 0 : (int)GetLastError());
+    if (m_magOk) {
+        // Match Windows Magnifier's "Smooth edges of images and text" (ON by
+        // default there). Without this the fullscreen transform looks
+        // blocky/pixelated in comparison. Undocumented API, best-effort.
+        BOOL sok = magSetFullscreenUseBitmapSmoothing(TRUE);
+        qDebug() << "Magnivo: SetFullscreenUseBitmapSmoothing(TRUE) =" << (int)sok
+                 << "err =" << (sok ? 0 : (int)GetLastError());
+    }
     if (m_magOk && pMagSetFullscreenColorEffect) {
         // Explicit identity color matrix. On some drivers the default
         // color effect is black (all zeros) -> entire screen goes black.
@@ -1124,7 +1149,7 @@ Magnivo::~Magnivo() {
     // Back to normal only if we actually zoomed.
     if (m_magOk && m_transformActive) {
         magSetFullscreenTransform(1.0f, 0, 0);
-        if (pMagSetInputTransform) pMagSetInputTransform(FALSE, nullptr, nullptr);
+        updateInputTransform(false, MagRect{}, MagRect{});
         m_transformActive = false;
     }
     if (m_magOk) magUninitialize();
@@ -1143,11 +1168,7 @@ void Magnivo::show() {
     // Keep our own control panel unmagnified so it stays small/clickable
     // while everything else is zoomed fullscreen. Best-effort: if this
     // fails we still zoom, panel just gets magnified too.
-    if (m_magOk && pMagSetWindowFilterList) {
-        HWND hwndPanel = reinterpret_cast<HWND>(m_panel->winId());
-        BOOL fok = magSetWindowFilterList(nullptr, MW_FILTERMODE_EXCLUDE, 1, &hwndPanel);
-        qDebug() << "Magnivo: SetWindowFilterList(exclude panel) =" << (int)fok << "err =" << (fok ? 0 : (int)GetLastError());
-    }
+    applyWindowFilter();
 #endif
     // no transform here - stays normal until armed
 }
@@ -1217,7 +1238,17 @@ void Magnivo::openSettings() {
 
 void Magnivo::openSettingsTab(int tab) {
     SettingsDialog dlg(m_panel, tab);
-    if (dlg.exec() == QDialog::Accepted) {
+    m_settingsDlg = &dlg;
+#ifdef Q_OS_WIN
+    dlg.winId(); // force the native handle into existence before filtering
+    applyWindowFilter(); // keep settings small/clickable while zoomed too
+#endif
+    const int rc = dlg.exec();
+    m_settingsDlg = nullptr;
+#ifdef Q_OS_WIN
+    applyWindowFilter(); // back to panel-only exclusion
+#endif
+    if (rc == QDialog::Accepted) {
         int vk = dlg.selectedModifier();
         ZoomMod::save(vk);
         int theme = dlg.selectedTheme();
@@ -1317,71 +1348,161 @@ void Magnivo::onAutoUpdateCheckFinished() {
     }
 }
 
+void Magnivo::applyWindowFilter() {
+#ifdef Q_OS_WIN
+    if (!m_magOk || !pMagSetWindowFilterList) return;
+    // Window handles must exist: winId() forces native creation.
+    // NOTE: passing NULL as the magnification window (the documented way to
+    // address the fullscreen magnifier) fails with ERROR_INVALID_HANDLE on
+    // current Windows 11 - there is no public way to exclude windows from
+    // fullscreen magnification there. Kept best-effort: where it succeeds
+    // our UI stays small/clickable; where it fails the panel is simply
+    // magnified along (still fully clickable with the mouse).
+    HWND list[2];
+    int n = 0;
+    if (m_panel) list[n++] = reinterpret_cast<HWND>(m_panel->winId());
+    if (m_settingsDlg) list[n++] = reinterpret_cast<HWND>(m_settingsDlg->winId());
+    if (n == 0) return;
+    BOOL fok = magSetWindowFilterList(nullptr, MW_FILTERMODE_EXCLUDE, n, list);
+    qDebug() << "Magnivo: SetWindowFilterList(exclude own UI, n =" << n << ") ="
+             << (int)fok << "err =" << (fok ? 0 : (int)GetLastError());
+#endif
+}
+
+void Magnivo::updateInputTransform(bool wantOn, const MagRect &src, const MagRect &dst) {
+#ifdef Q_OS_WIN
+    if (!pMagSetInputTransform) return;
+    // Only touch the driver when something actually changed: the 60fps tick
+    // calls here constantly, and a failing call (no UIAccess) must not spam.
+    if (wantOn == m_inputOn && (wantOn == false || (src == m_lastSrc && dst == m_lastDst)))
+        return;
+    m_lastSrc = src;
+    m_lastDst = dst;
+    BOOL ok = FALSE;
+    if (wantOn) {
+        RECT s{ src.l, src.t, src.r, src.b };
+        RECT d{ dst.l, dst.t, dst.r, dst.b };
+        ok = pMagSetInputTransform(TRUE, &s, &d);
+    } else {
+        ok = pMagSetInputTransform(FALSE, nullptr, nullptr);
+    }
+    if (ok) {
+        m_inputOn = wantOn;
+    } else if (!m_inputWarned) {
+        m_inputWarned = true; // log once, not 60x/sec
+        qWarning() << "Magnivo: MagSetInputTransform failed, err =" << (int)GetLastError()
+                   << "- touch/pen taps need UIAccess (signed, installed build)."
+                   << "Mouse clicks still work: they track the cursor.";
+    }
+#else
+    Q_UNUSED(wantOn); Q_UNUSED(src); Q_UNUSED(dst);
+#endif
+}
+
 void Magnivo::applyTransform() {
 #ifdef Q_OS_WIN
     if (!m_magOk) return;
-    auto resetView = []() {
+    auto resetView = [this]() {
         magSetFullscreenTransform(1.0f, 0, 0);
         // Touch/pen taps are mapped into the magnified view while zoomed;
         // switch that mapping off again so taps land 1:1 when normal.
-        if (pMagSetInputTransform) pMagSetInputTransform(FALSE, nullptr, nullptr);
+        updateInputTransform(false, MagRect{}, MagRect{});
+        m_transformActive = false;
+        m_lastMag = 0.0f;
+        m_sameCount = 0;
     };
     if (!m_armed) {
         // Only reset once - spamming MagSetFullscreenTransform(1.0) at 60fps
         // is wasteful. m_transformActive tracks whether a zoom is live.
         if (m_transformActive) {
             resetView();
-            m_transformActive = false;
         }
         return;
     }
     POINT pt; GetCursorPos(&pt);
-    int sw = GetSystemMetrics(SM_CXSCREEN);
-    int sh = GetSystemMetrics(SM_CYSCREEN);
-    if (sw <= 0 || sh <= 0) return;
+    // Physical pixels throughout: the process is PerMonitorV2 DPI-aware
+    // (manifest + main.cpp), and Mag offsets are documented as
+    // DPI-independent.
+    // The magnified view is shown fullscreen on every monitor, so the
+    // source rect must be sized from the MONITOR holding the cursor
+    // (monitor/mag, cursor centered) - NOT from the whole virtual desktop.
+    // Sizing from the virtual screen puts the cursor off-center on
+    // multi-monitor setups and samples at the wrong resolution (blurry),
+    // and the view drifts so far that edge buttons become unreachable.
+    MONITORINFO mi = {};
+    mi.cbSize = sizeof(mi);
+    int monL = 0, monT = 0;
+    int monW = GetSystemMetrics(SM_CXSCREEN);
+    int monH = GetSystemMetrics(SM_CYSCREEN);
+    if (HMONITOR hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST)) {
+        if (GetMonitorInfoW(hMon, &mi)) {
+            monL = mi.rcMonitor.left;
+            monT = mi.rcMonitor.top;
+            monW = mi.rcMonitor.right - mi.rcMonitor.left;
+            monH = mi.rcMonitor.bottom - mi.rcMonitor.top;
+        }
+    }
+    if (monW <= 0 || monH <= 0) return;
+    // Virtual screen (bounding rect of all monitors): only used to clamp
+    // the source rect so we never sample outside the desktop, and to
+    // adjust offsets when the virtual origin is left/above primary.
+    const int vLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const int vTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const int vW = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    const int vH = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    if (vW <= 0 || vH <= 0) return;
     float mag = m_zoom < 1.0f ? 1.0f : m_zoom;
     // Armed at 100% = "listen for gestures but don't zoom": leave the screen
     // untouched instead of spamming an identity transform at 60fps.
     if (mag <= 1.001f) {
         if (m_transformActive) {
             resetView();
-            m_transformActive = false;
         }
         return;
     }
+    // Source rect shown fullscreen, centered on the cursor.
+    const int viewW = qMax(1, int(std::llround(monW / double(mag))));
+    const int viewH = qMax(1, int(std::llround(monH / double(mag))));
+    int srcL = int(std::llround(double(pt.x) - viewW / 2.0));
+    int srcT = int(std::llround(double(pt.y) - viewH / 2.0));
+    // Clamp so source rect stays inside the desktop -> never show black
+    // space past the edges. (Near edges the cursor is intentionally no
+    // longer exactly centered - same as Windows Magnifier.)
+    srcL = qBound(vLeft, srcL, qMax(vLeft, vLeft + vW - viewW));
+    srcT = qBound(vTop, srcT, qMax(vTop, vTop + vH - viewH));
     // IMPORTANT: xOffset/yOffset are in UNMAGNIFIED coords, relative to the
     // top-left of the primary monitor (see MagSetFullscreenTransform docs).
-    // The source rect shown fullscreen is [xOff, xOff + sw/mag].
-    // To keep the cursor centered: xOff = cx - (sw/mag)/2.
-    // Old code used magnified coords (sw/2 - mag*cx) which pushed the
-    // source rect far off-screen -> black screen, or clamped to (0,0)
-    // which looked like "zoom to top-left".
-    int viewW = int(sw / mag);
-    int viewH = int(sh / mag);
-    if (viewW < 1) viewW = 1;
-    if (viewH < 1) viewH = 1;
-    int xOff = int(double(pt.x) - viewW / 2.0);
-    int yOff = int(double(pt.y) - viewH / 2.0);
-    // Clamp so source rect stays inside the desktop -> never show black
-    // space past the edges. Valid range: [0, sw - sw/mag].
-    int xMax = sw - viewW;
-    int yMax = sh - viewH;
-    if (xMax < 0) xMax = 0;
-    if (yMax < 0) yMax = 0;
-    xOff = qBound(0, xOff, xMax);
-    yOff = qBound(0, yOff, yMax);
+    // The transform is global over the virtual desktop: virtual pixel p shows
+    // source (p/mag + xOff). To center the view on the cursor's own monitor
+    // (origin monL/monT), the offsets must subtract THAT monitor's origin
+    // divided by the magnification (Microsoft's virtual-origin example
+    // generalized per-monitor). Using the virtual origin here instead is only
+    // correct on the leftmost/topmost monitor - on any other screen the whole
+    // magnified image shifts, so hover/clicks visibly miss their targets.
+    const int xOff = srcL - int(monL / double(mag));
+    const int yOff = srcT - int(monT / double(mag));
+    // Skip redundant driver calls when the cursor didn't move, but re-apply
+    // ~1x/sec to self-heal if something else reset the transform.
+    if (m_transformActive && mag == m_lastMag && xOff == m_lastXOff && yOff == m_lastYOff) {
+        if (++m_sameCount < 60) {
+            return;
+        }
+    }
+    m_sameCount = 0;
     if (magSetFullscreenTransform(mag, xOff, yOff)) {
         m_transformActive = true;
+        m_lastMag = mag;
+        m_lastXOff = xOff;
+        m_lastYOff = yOff;
         // Map touch/pen input into the zoomed view: without this a tap on the
         // VISIBLE (magnified) X/minimize/file lands at the raw unmagnified
-        // point instead, so taps miss while zoomed (mouse is unaffected, it
-        // only needs this for pen/touch). Near the screen center the error is
-        // tiny, which is why taps sometimes seemed to work and sometimes not.
-        if (pMagSetInputTransform) {
-            RECT src{ xOff, yOff, xOff + viewW, yOff + viewH };
-            RECT dst{ 0, 0, sw, sh };
-            pMagSetInputTransform(TRUE, &src, &dst);
-        }
+        // point instead, so taps miss while zoomed (mouse aims with the
+        // cursor itself, so it tracks without this; touch needs it).
+        // Requires UIAccess - without it the call fails (see warning) and
+        // touch routing stays 1:1.
+        MagRect src{ srcL, srcT, srcL + viewW, srcT + viewH };
+        MagRect dst{ monL, monT, monL + monW, monT + monH };
+        updateInputTransform(true, src, dst);
     }
 #endif
 }
