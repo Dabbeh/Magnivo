@@ -10,7 +10,7 @@
 ;        C:\Qt\6.10.0\mingw_64\bin\windeployqt.exe --release --no-translations deploy\Magnivo.exe
 ;   3. Compile this script (needs Inno Setup 6 installed):
 ;        "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\Magnivo.iss
-;      The finished installer lands in installer\Output\Magnivo-Setup-1.1.1.exe
+;      The finished installer lands in installer\Output\Magnivo-Setup-1.2.0.exe
 ;
 ; ICONS - every place Windows can show one is wired below:
 ;   SetupIconFile ......... icon of the installer exe itself + top of the wizard
@@ -22,7 +22,7 @@
 ;                           and Magnivo.rc bakes logo.ico into the exe file.
 
 #define MyAppName "Magnivo"
-#define MyAppVersion "1.1.1"
+#define MyAppVersion "1.2.0"
 #define MyAppExe "Magnivo.exe"
 
 [Setup]
@@ -51,8 +51,13 @@ VersionInfoCopyright=Magnivo
 Source: "..\deploy\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs
 
 [Icons]
-; Start Menu shortcut (icon comes from the installed exe):
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"; IconFilename: "{app}\{#MyAppExe}"
+; Start Menu shortcut (icon comes from the installed exe).
+; HotKey gives a system-wide LAUNCH hotkey: Ctrl+Alt+G anywhere starts
+; Magnivo - or summons its panel if already running (the app refuses a
+; second instance over a local pipe, so mashing the hotkey is harmless).
+; NOTE: keep the hotkey on this entry ONLY. Two shortcuts with the same
+; hotkey fight over which one Windows fires.
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"; IconFilename: "{app}\{#MyAppExe}"; HotKey: "ctrl+alt+g"
 ; Optional desktop shortcut (unchecked by default):
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"; IconFilename: "{app}\{#MyAppExe}"; Tasks: desktopicon
 

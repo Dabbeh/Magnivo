@@ -27,8 +27,10 @@ small floating control panel, using the Windows Magnification API
 
 | Action | What happens |
 |---|---|
+| `Ctrl+Alt+G` (installed version) | Launch Magnivo, or bring its panel forward if open |
 | `Ctrl` + wheel / two-finger scroll (anywhere) | Zoom at the cursor (auto-arms) |
 | `ACTIVATE` button, `F8` or `Ctrl+Alt+M` | Arm/disarm gesture mode |
+| `Ctrl+Alt++` / `Ctrl+Alt+-` (anywhere) | Zoom in/out in steps (auto-arms, hold to repeat) |
 | Wheel / pinch while ACTIVE (green) | Zoom with no key held |
 | `+` / `-` buttons | Zoom in steps (auto-arm) |
 | Gear icon | Settings: zoom key, dark/light look, updates, about |

@@ -184,6 +184,20 @@ static void requestToggle() {
     }
 }
 
+static qint64 g_lastZoomKeyMs = 0;
+
+static void requestZoomStep(bool zoomIn) {
+    qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (now - g_lastZoomKeyMs < 60) return; // throttle key auto-repeat: one press = one step
+    g_lastZoomKeyMs = now;
+    if (g_inst) {
+        Magnivo *inst = g_inst;
+        QTimer::singleShot(0, inst, [inst, zoomIn]() {
+            if (zoomIn) inst->zoomIn(); else inst->zoomOut();
+        });
+    }
+}
+
 static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
     // Handle vertical + horizontal wheel. Touchpads often emit high-res
     // partial deltas and/or injected Ctrl+wheel for pinch: treat every tick
@@ -231,6 +245,20 @@ static LRESULT CALLBACK KbProc(int nCode, WPARAM wParam, LPARAM lParam) {
             bool alt = GetAsyncKeyState(VK_MENU) & 0x8000;
             if (ctrl && alt) {
                 requestToggle();
+                return 1;
+            }
+        }
+        // Ctrl+Alt+Plus / Ctrl+Alt+Minus zooms in/out anywhere (main keys or
+        // numpad). Same as the panel's + / - buttons, so it auto-arms.
+        // Holding the keys repeats for smooth continuous zoom. Deliberately
+        // NOT Win+Plus/Minus: those belong to Windows Magnifier and stealing
+        // them would break it.
+        if (kb->vkCode == VK_ADD || kb->vkCode == VK_OEM_PLUS ||
+            kb->vkCode == VK_SUBTRACT || kb->vkCode == VK_OEM_MINUS) {
+            bool ctrl = GetAsyncKeyState(VK_CONTROL) & 0x8000;
+            bool alt = GetAsyncKeyState(VK_MENU) & 0x8000;
+            if (ctrl && alt) {
+                requestZoomStep(kb->vkCode == VK_ADD || kb->vkCode == VK_OEM_PLUS);
                 return 1;
             }
         }
@@ -367,8 +395,8 @@ ControlPanel::ControlPanel(QWidget *parent) : QWidget(parent), m_theme(Theme::lo
     m_label->setAlignment(Qt::AlignCenter);
     m_label->setMinimumWidth(72);
     m_label->setAttribute(Qt::WA_TransparentForMouseEvents, true);
-    minusBtn->setToolTip("Zoom out (auto-activates)");
-    plusBtn->setToolTip("Zoom in (auto-activates)");
+    minusBtn->setToolTip("Zoom out anywhere: Ctrl+Alt+- (auto-activates)");
+    plusBtn->setToolTip("Zoom in anywhere: Ctrl+Alt++ (auto-activates)");
     botRow->addWidget(minusBtn);
     botRow->addWidget(m_label, 1);
     botRow->addWidget(plusBtn);
@@ -755,6 +783,10 @@ SettingsDialog::SettingsDialog(QWidget *parent, int initialTab) : QDialog(parent
                 "<p><b>Use:</b> hold <b>%2 + wheel</b> anywhere to zoom at the cursor, "
                 "or press <b>ACTIVATE (F8)</b> then use the wheel / pinch with no keys. "
                 "<b>+ / -</b> zoom in steps.</p>"
+                "<p><b>Keys:</b> <b>F8</b> or <b>Ctrl+Alt+M</b> arms/disarms, "
+                "<b>Ctrl+Alt++ / Ctrl+Alt+-</b> zooms in/out anywhere.</p>"
+                "<p><b>Launch:</b> after installing, <b>Ctrl+Alt+G</b> launches "
+                "Magnivo from anywhere - or brings its panel forward when open.</p>"
                 "<p><b>Desktop tip:</b> a bare pinch with no key only zooms while ACTIVE "
                 "(or directly over the Magnivo panel). When OFF it is ignored on purpose, "
                 "so use <b>%2 + scroll</b> there.</p>"
@@ -1055,7 +1087,10 @@ void SettingsDialog::onDownloadFinished() {
     m_stats->setText(QString("%1 downloaded").arg(fmtSize(fi.size())));
     setStatus("Download complete. Press \"Install && Restart\" to update.");
     m_installBtn->setEnabled(true);
-    m_checkBtn->setEnabled(true);
+    // Leave "Check for updates" DISABLED now that an update is downloaded and
+    // ready: pressing it again would restart the whole check/download flow by
+    // accident. Install && Restart is the only way forward from here. (Check
+    // stays enabled after a FAILED check/download, so retry is still possible.)
     m_installBtn->setFocus();
 }
 
@@ -1171,6 +1206,15 @@ void Magnivo::show() {
     applyWindowFilter();
 #endif
     // no transform here - stays normal until armed
+}
+
+void Magnivo::summon() {
+    // Second launch (e.g. the Ctrl+Alt+G shortcut hotkey while running):
+    // bring the existing panel forward instead of starting a rival instance.
+    if (!m_panel) return;
+    m_panel->show();
+    m_panel->raise();
+    m_panel->activateWindow();
 }
 
 void Magnivo::setZoom(float z) {

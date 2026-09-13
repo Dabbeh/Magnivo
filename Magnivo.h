@@ -9,7 +9,7 @@
 
 // App version shown in About + used by the in-app updater to compare
 // against the latest GitHub release tag (e.g. "v1.1.0").
-static const char *kMagnivoVersion = "1.1.1";
+static const char *kMagnivoVersion = "1.2.0";
 
 // GitHub repo used by the updater. Hardcoded so users never have to type it.
 // Releases in this repo are checked on startup + via Settings > Update.
@@ -194,6 +194,7 @@ public:
     explicit Magnivo(QObject *parent = nullptr);
     ~Magnivo();
     void show();
+    void summon(); // single instance: bring the panel forward (launch hotkey while running)
     float zoom() const { return m_zoom; }
     bool armed() const { return m_armed; }
 
